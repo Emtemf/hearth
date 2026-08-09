@@ -1,0 +1,33 @@
+# Java / Maven
+target/
+*.jar
+*.war
+*.class
+.mvn/wrapper/maven-wrapper.jar
+
+# Frontend
+node_modules/
+dist/
+.vite/
+hearth-api/src/main/resources/static/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+*.swp
+
+# Secrets — never commit
+.env
+.env.*
+!.env.example
+*.env
+
+# Gateway capture output — contains raw prompts and may contain secrets.
+.hearth/
+var/
+*.jsonl
+
+# Runtime
+.omc/
+*.log
