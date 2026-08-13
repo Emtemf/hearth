@@ -6,7 +6,13 @@ Web UI 和后端之间的接口定义。所有响应用统一信封：
 { "data": null,   "error": { "code": "module.error_type", "message": "..." } }
 ```
 
+信封适用于 JSON 业务 API；SSE 使用 `text/event-stream`，Artifact/raw 下载使用对应内容类型，Actuator 保持
+Spring Boot 健康检查契约。它们的错误仍使用稳定 code，但不能为了套信封破坏各自的 wire protocol。
+
 Base path: `/api/v1`
+
+M1 首次启动先由受信环境配置幂等创建 local workspace/root/provider route/coder profile/local worker，详见
+`docs/08-operations.md`。浏览器不负责创建这些安全边界记录。
 
 ## API 安全基线
 
@@ -34,7 +40,7 @@ Base path: `/api/v1`
 ### GET /api/v1/sessions
 列出所有 session，分页。
 
-Query: `?page=0&size=20&status=RUNNING&workspaceId=xxx`
+Query: `?page=0&size=20&status=ACTIVE&workspaceId=xxx`
 
 Response data:
 ```json
@@ -42,7 +48,7 @@ Response data:
   "content": [{
     "id": "uuid",
     "agentRole": "coder",
-    "status": "RUNNING",
+    "status": "ACTIVE",
     "observabilityLevel": "full",
     "effectiveModel": "claude-opus-4",
     "inputTokens": 24391,
@@ -65,13 +71,13 @@ Response data:
 {
   "id": "uuid",
   "agentRole": "coder",
-  "status": "RUNNING",
+  "status": "ACTIVE",
   "observabilityLevel": "full",
   "observabilityReason": "proxied",
   "effectiveModel": "claude-opus-4",
   "requestedModel": "claude-sonnet-5",
   "providerRouteId": "uuid",
-  "effectiveModel": "claude-opus-4",
+  "pricingStatus": "known",
   "wireProtocol": "anthropic",
   "workerId": "worker-A",
   "workspaceRootId": "uuid",
@@ -81,7 +87,7 @@ Response data:
   "depth": 1,
   "createdAt": "2026-08-09T10:00:00Z",
   "endedAt": null,
-  "taskId": "uuid",
+  "taskId": null,
   "latestSystemPrompt": "# Hearth\n## 愿景...",  // 最近一次 exchange 的完整 system prompt
   "latestSystemPromptRecordingStatus": "complete"  // complete/partial/failed
 }
@@ -137,7 +143,7 @@ Anthropic 请求会在每次 exchange 中重复发送此前完整 message histor
 4. 若历史被 Claude Code 压缩或改写、无法形成前缀，则保留新分支并生成
    `conversation.compacted`/`conversation.diverged` 事件；不能误删不同位置的相同文本。
 5. `tool_use` 与 `tool_result` 以 provider 的 tool-use ID 关联；无 ID 时才使用 fingerprint + 顺序兜底。
-6. 展示顺序用 `domain_event.event_id` 和 exchange 内位置，不按多机时间戳排序。
+6. 展示顺序用 `event_publication.publication_seq` 和 exchange 内位置，不按多机时间戳排序。
 
 因此，去重键不是“文本全局唯一”：用户重复说两次“继续”必须显示两次。持久化实现可用规范化 turn 表，
 也可在 M1 查询时按上述算法投影；契约和测试必须相同。
@@ -184,7 +190,11 @@ Response data:
 
 从 `body_ref` / `response_body_ref` 流式下载录制原文，仅用于本地调试。要求：
 - 只允许当前 workspace 的显式用户操作，不允许 agent capability token 调用。
-- 返回前按协议执行 secret redaction；无法可靠脱敏则返回 `409 recording.raw_not_safe`，不降级泄露。
+- 默认 `hearth.recording.raw-download-enabled=false`；用户显式开启后仍要求管理员会话、CSRF/Origin 和审计。
+- 返回前按协议移除 header/query/已知结构字段中的 credential，并扫描当前已加载 secret 的指纹；解析失败或
+  命中无法安全替换的已知 credential 时返回 `409 recording.raw_not_safe`。
+- 平台不能可靠识别用户消息、文件或工具输出里任意形态的第三方 secret；开启 raw download 的页面和响应头
+  必须明确标为“包含未脱敏会话内容”，不能用“已自动脱敏”制造虚假安全保证。
 - 响应使用 `Content-Disposition: attachment`、`X-Content-Type-Options: nosniff`，UI 不以内联 HTML 渲染。
 - 每次下载写入审计事件，日志不记录 body。
 - body 不存在时区分 `404 recording.body_not_recorded` 与 `410 recording.body_deleted`。
@@ -211,7 +221,10 @@ Request body:
 `workspaceRootId + relativeCwd` 解析 canonical path，并拒绝目录逃逸。M1 只允许 route 到与当前 CLI
 wire protocol 兼容的 endpoint，不做隐式跨协议翻译。
 
-Response data: session 对象 + `gatewayBaseUrl`（注入 agent 的 BASE_URL）
+Response data: session 对象。`gatewayBaseUrl` 和已启用 audience 的 capability token 由 Session application
+service 直接写入 `LaunchCommand` 的受保护环境，不返回浏览器，也不进入普通 API DTO。若 Worker 返回
+`UNKNOWN_COMMIT_STATE`，Session 保持 `LAUNCHING` 并进入 reconcile，API 返回已创建的 Session 和明确状态，
+不能再发一次新的 LAUNCH。
 
 ### Invocation
 
@@ -236,6 +249,10 @@ POST /api/v1/invocations/:id/cancel
 `semanticCompletedAt`、`processExitedAt` 和 `transportStatus` 是独立字段。取消 Invocation 会结束当前执行
 和所有等待通道；是否保留可复用 Session 进程由 adapter/session policy 决定。
 
+同一 Session 默认只允许一个非终态 Invocation。服务端在短事务中创建 Invocation 并建立 active binding，
+提交后才调用 `WorkerClient.invoke`。冲突返回 `409 invocation.already_active`。Gateway 只把请求归属给该
+唯一 active Invocation；没有 active binding 时返回 `409 gateway.no_active_invocation`，不按时间猜测。
+
 ---
 
 ## Task（M2）
@@ -257,7 +274,8 @@ Response data:
   "nodes": [{
     "id": "session-uuid",
     "agentRole": "architect",
-    "status": "COMPLETED",
+    "status": "TERMINATED",
+    "terminalReason": "completed",
     "usd": 0.34,
     "startedAt": "...",
     "endedAt": "..."
@@ -337,19 +355,36 @@ Artifact 引用由 `artifact_reference` 管理。被 checkpoint、Inbox、operat
 ### GET /api/v1/sse?traceId=xxx
 过滤到指定任务的事件流。
 
+可选 `after={publicationSeq}` 仅用于拉取 snapshot 后新建连接；普通断线由同一个原生 `EventSource` 通过
+`Last-Event-ID` 自动恢复。两者同时出现时必须一致，否则返回 `400 sse.cursor_conflict`，禁止猜测游标。
+
 SSE 事件格式：
 ```
-id: {eventId}
+id: {publicationSeq}
 event: {eventType}
 data: {EventEnvelope JSON}
 ```
 
-前端用 `EventSource` 订阅，断线自动重连，服务端从 `Last-Event-ID` 续传。事件 payload 必须携带
-`aggregateId`、`aggregateVersion` 和相关 `invocationId`；前端按 `eventId` 去重。
+前端用 `EventSource` 订阅，断线自动重连，服务端从 `Last-Event-ID` 续传。这里的 SSE `id` 是
+`event_publication.publication_seq`，不是 `domain_event.event_id`。事件 payload 必须携带内部 `eventId`、
+`publicationSeq`、`aggregateId`、`aggregateVersion` 和相关 `invocationId`；前端按 `publicationSeq` 去重。
 
-若 `Last-Event-ID` 已超过事件保留窗口，服务端返回显式 `410 event.cursor_expired` 和 snapshot endpoint。
-前端拉 REST snapshot（响应含 `eventWatermark`），原子替换 React Query 缓存，再从 watermark 继续 SSE。
-因此 durable 状态已提交但 final SSE 丢失时，UI 最终仍能收敛；不能永久停在“回复中”。
+原生 `EventSource` 不向业务代码暴露可可靠解析的 410 响应体。若 `Last-Event-ID` 已超过事件保留窗口，
+服务端建立正常 `text/event-stream` 响应，发送一条控制事件后关闭：
+
+```text
+event: cursor.expired
+data: {"snapshotUrl":"/api/v1/snapshot?traceId=xxx"}
+```
+
+前端收到后主动关闭旧 EventSource，拉 snapshot，原子替换 React Query 缓存，再用
+`?after={eventWatermark}` 建立新连接。因此 durable 状态已提交但 final SSE 丢失时，UI 最终仍能收敛。
+
+### GET /api/v1/snapshot
+
+Query 可选 `?traceId=xxx`。返回当前授权范围内的 Task/Session/Invocation/Exchange 汇总投影和
+`eventWatermark`。服务端在一个 `REPEATABLE READ` 只读事务中读取聚合快照，并读取该事务快照可见的最大
+`event_publication.publication_seq`；前端必须先替换快照，再从该 watermark 续传。
 
 M1 本地 Web API 仍需随机管理员会话 cookie、`HttpOnly`/`SameSite=Strict`、Origin 检查和 CSRF token。
 绑定 `127.0.0.1` 只是网络暴露限制，不是认证；gateway/MCP capability token 不能调用管理 API 或下载 raw body。
@@ -357,7 +392,7 @@ M1 本地 Web API 仍需随机管理员会话 cookie、`HttpOnly`/`SameSite=Stri
 支持的事件类型（前端关心的）：
 ```
 task.status_changed
-session.started / session.ended / session.crashed
+session.ready / session.active / session.terminated / session.crashed
 exchange.response          ← 每次模型调用结束，含 token 用量
 a2a.dispatched             ← 调用图新增边
 inbox.created              ← Inbox 新条目，触发 badge 更新
@@ -374,11 +409,7 @@ Spring Boot Actuator，M1 必须有。
 
 Response:
 ```json
-{
-  "status": "UP",
-  "components": {
-    "db": { "status": "UP" },
-    "gateway": { "status": "UP", "lastForwardMs": 4823 }
-  }
-}
+{"status":"UP"}
 ```
+
+未认证探活只返回总体状态；带管理员会话的诊断请求才返回 db/gateway components 和脱敏详情。

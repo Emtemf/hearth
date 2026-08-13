@@ -97,7 +97,7 @@ new ProcessBuilder("claude", "-p",
 
 ```
 请求  一次性 JSON POST，需要完整读取才能抽 system prompt / 改写 model
-      → 可以缓冲，无所谓
+      → 小请求内存缓冲，大请求写权限受限临时文件；始终有硬上限
 响应  SSE 流，agent 逐 token 等着显示
       → 必须逐事件透传，禁止攒完整响应；M1 验收附加 p95 TTFB ≤ 50ms
 ```
@@ -123,6 +123,10 @@ while ((n = upstream.read(buf)) != -1) {
     recorder.offerLossy(buf, 0, n);    // 异步录制，满则丢
 }
 ```
+
+“字节级透传”主要约束响应流和未知字段保留，并不表示改写 `model` 后请求字节完全相同。请求解析必须使用
+保留未知 JSON 字段的 tree/stream 方式，只修改明确允许的字段；同时保存脱敏后的原始请求录制。M1 默认
+请求硬上限 32 MiB，超过 1 MiB 不留在单个 heap byte array，而是 spool 到 0600 临时文件，转发完成后删除。
 
 ---
 

@@ -9,15 +9,17 @@ Flyway 管理，文件放 `hearth-core/src/main/resources/db/migration/`。
 
 ```
 workspace ──< workspace_root
-          ──< provider_route
+          ──< provider_route ──< provider_pricing
           ──< task ──< session ──< session_process
                              ├────< invocation ──< exchange
                              └────< worker_event_receipt
                   ──< a2a_message
                   ──< budget_node ──< budget_node（自引用树）
-                  ──< checkpoint
+                  ──< checkpoint_execution
+                  ──< task_goal_verification
 
 session ──< invocation ──< exchange
+        ──< worker_command
         ──< artifact ──< artifact_reference
         ──< session_credential
 worker ──< worker_credential
@@ -26,15 +28,16 @@ worker ──< worker_credential
 task ──< cancellation_outbox
 inbox_item ──> task / session（外键可空）
 memory_card ──> source_sessions（JSONB 数组）
+domain_event ── event_publication（提交后 SSE 可见顺序）
 ```
 
 ---
 
 ## V001__core_schema.sql — 完整核心结构
 
-V001 一次创建 M1/M2 共用的完整关系结构。M1 只使用 `workspace`、`workspace_root`、`provider_route`、Profile、Worker、
-`session`、`invocation`、`worker_event_receipt`、`session_credential`、`exchange`、`artifact` 和
-`domain_event`；Task/A2A 表虽然存在，
+V001 一次创建 M1/M2 共用的完整关系结构。M1 只使用 `workspace`、管理认证、`workspace_root`、
+`provider_route`/pricing、Profile、Worker、`session`、`invocation`、`worker_command`、
+`worker_event_receipt`、`session_credential`、`exchange`、`domain_event` 和 `event_publication`；Task/A2A 表虽然存在，
 但直到 M2 才有业务流量。**里程碑通过功能开关和应用入口控制，不通过缺表控制。**
 
 这样所有外键在一次 migration 内均有合法目标，空库执行 V001 不依赖未来 migration。
@@ -53,6 +56,33 @@ CREATE TABLE workspace (
 
 M1/M2 单 workspace，表存在但只有一行。开源后扩展多租户。
 
+### admin_bootstrap_credential / admin_session（M1 本地管理面认证）
+
+```sql
+CREATE TABLE admin_bootstrap_credential (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    token_hash  BYTEA NOT NULL UNIQUE,
+    expires_at  TIMESTAMPTZ NOT NULL,
+    consumed_at TIMESTAMPTZ,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE admin_session (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_token_hash  BYTEA NOT NULL UNIQUE,
+    csrf_token_hash     BYTEA NOT NULL,
+    expires_at          TIMESTAMPTZ NOT NULL,
+    revoked_at          TIMESTAMPTZ,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_used_at        TIMESTAMPTZ
+);
+```
+
+两类 token 都是 256-bit CSPRNG opaque value，数据库只存 SHA-256。bootstrap credential 单次消费；
+管理员 cookie 和 CSRF token 独立，logout/过期后撤销。表中不存 bootstrap 明文或浏览器 cookie 明文。
+
 ### workspace_root / provider_route（受信配置引用）
 
 ```sql
@@ -64,7 +94,8 @@ CREATE TABLE workspace_root (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (workspace_id, name),
-    UNIQUE (workspace_id, canonical_path)
+    UNIQUE (workspace_id, canonical_path),
+    UNIQUE (id, workspace_id)
 );
 
 CREATE TABLE provider_route (
@@ -79,7 +110,24 @@ CREATE TABLE provider_route (
     version               BIGINT NOT NULL DEFAULT 0,
     created_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (workspace_id, name)
+    UNIQUE (workspace_id, name),
+    UNIQUE (id, workspace_id)
+);
+
+CREATE TABLE provider_pricing (
+    id                    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    provider_route_id     UUID NOT NULL REFERENCES provider_route(id),
+    model                 TEXT NOT NULL,
+    version               INTEGER NOT NULL,
+    currency              TEXT NOT NULL DEFAULT 'USD',
+    rates                 JSONB NOT NULL,
+                          -- input/output/cache read/cache write 及可能的 context tier 单价
+    effective_from        TIMESTAMPTZ NOT NULL,
+    effective_until       TIMESTAMPTZ,
+    created_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (provider_route_id, model, version),
+    UNIQUE (id, provider_route_id, model)
 );
 ```
 
@@ -99,7 +147,8 @@ CREATE TABLE agent_profile (
     current_version_id UUID,                   -- 指向最新版本，启动后更新
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (workspace_id, role)
+    UNIQUE (workspace_id, role),
+    UNIQUE (id, workspace_id)
 );
 
 CREATE TABLE agent_profile_version (
@@ -109,12 +158,17 @@ CREATE TABLE agent_profile_version (
     system_prompt   TEXT NOT NULL,
     tool_whitelist  JSONB NOT NULL DEFAULT '[]',   -- ["read_file","write_file",...]
     constraints     JSONB NOT NULL DEFAULT '[]',   -- [{rule, disposition}]
+    adapter_type    TEXT NOT NULL,                  -- claude-code/codex/gemini/opencode/pi-rpc
+    required_governance TEXT NOT NULL DEFAULT 'OBSERVE_ONLY',
     preferred_model TEXT NOT NULL,
     memory_scope    JSONB NOT NULL DEFAULT '{}',   -- {workspace, agentRoles, tags}
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (profile_id, version),
     UNIQUE (id, profile_id)
 );
+
+ALTER TABLE agent_profile ADD CONSTRAINT fk_agent_profile_current_version
+    FOREIGN KEY (current_version_id, id) REFERENCES agent_profile_version(id, profile_id);
 ```
 
 ---
@@ -137,6 +191,7 @@ CREATE TABLE task (
     evidence_policy JSONB NOT NULL DEFAULT '{"required":true,"acceptedTypes":[]}',
     -- 触发
     trigger_kind    TEXT NOT NULL,              -- manual / cron / webhook / inbound_message
+    trigger_key     TEXT,                       -- 自动/外部触发的稳定去重键；手动创建可空
     trigger_config  JSONB NOT NULL DEFAULT '{}',
     -- 生命周期
     status          TEXT NOT NULL DEFAULT 'PENDING',
@@ -150,7 +205,8 @@ CREATE TABLE task (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     ended_at        TIMESTAMPTZ,
-    UNIQUE (id, workspace_id)
+    UNIQUE (id, workspace_id),
+    UNIQUE (workspace_id, trigger_key)
 );
 
 CREATE INDEX idx_task_workspace_status ON task(workspace_id, status);
@@ -250,11 +306,15 @@ CREATE TABLE session (
     agent_profile_id    UUID NOT NULL REFERENCES agent_profile(id),
     profile_version_id  UUID NOT NULL,
     agent_role          TEXT NOT NULL,
+    adapter_type        TEXT NOT NULL,
+    adapter_version     INTEGER NOT NULL,
+    process_reuse_policy TEXT NOT NULL, -- STREAMING_STDIN / RESUME_PER_INVOCATION
     -- 观测
     observability_level  TEXT NOT NULL,   -- full / sidecar / none
     observability_reason TEXT NOT NULL,   -- proxied / subscription_auth / ...
     -- 模型路由（受信配置引用；快照字段用于历史解释）
     provider_route_id   UUID NOT NULL REFERENCES provider_route(id),
+    pricing_id          UUID REFERENCES provider_pricing(id),
     requested_model     TEXT,
     effective_model     TEXT NOT NULL,
     upstream_base_url   TEXT NOT NULL,
@@ -263,6 +323,7 @@ CREATE TABLE session (
     worker_id           TEXT REFERENCES worker(id),
     -- 生命周期
     status              TEXT NOT NULL DEFAULT 'PENDING',
+    terminal_reason     TEXT, -- TERMINATED/CRASHED 时解释 completed/cancelled/timed_out/failed/replaced
     version             BIGINT NOT NULL DEFAULT 0, -- 聚合状态 CAS
     fencing_generation  BIGINT NOT NULL DEFAULT 0, -- replacement/restart increments this value
     trace_id            UUID NOT NULL,
@@ -277,19 +338,30 @@ CREATE TABLE session (
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     ended_at            TIMESTAMPTZ,
+    UNIQUE (id, task_id),
+    UNIQUE (id, workspace_id),
+    FOREIGN KEY (task_id, workspace_id) REFERENCES task(id, workspace_id),
+    FOREIGN KEY (agent_profile_id, workspace_id) REFERENCES agent_profile(id, workspace_id),
     FOREIGN KEY (profile_version_id, agent_profile_id)
-        REFERENCES agent_profile_version(id, profile_id)
+        REFERENCES agent_profile_version(id, profile_id),
+    FOREIGN KEY (provider_route_id, workspace_id) REFERENCES provider_route(id, workspace_id),
+    FOREIGN KEY (pricing_id, provider_route_id, effective_model)
+        REFERENCES provider_pricing(id, provider_route_id, model),
+    FOREIGN KEY (workspace_root_id, workspace_id) REFERENCES workspace_root(id, workspace_id),
+    FOREIGN KEY (budget_node_id, task_id) REFERENCES budget_node(id, task_id)
 );
 
 CREATE INDEX idx_session_task_id ON session(task_id);
 CREATE INDEX idx_session_trace_id ON session(trace_id);
-CREATE INDEX idx_session_status ON session(status) WHERE status NOT IN ('COMPLETED','FAILED','CANCELLED','TIMED_OUT','CRASHED','TERMINATED');
+CREATE INDEX idx_session_status ON session(status) WHERE status NOT IN ('TERMINATED','CRASHED');
 ```
 
 `task_id` 在 M1 standalone session 中允许为 `NULL`，M2 编排 session 必须由应用层保证非空；
 不在数据库层全局改成 `NOT NULL`，否则会破坏长期保留的手动 session 能力。
 `resume_descriptor` 是 adapter 专属的带版本结构，禁止把未知裸字符串直接传给 CLI。恢复时重新解析
 `provider_route.credential_ref` 当前指向的 secret；不在 Session 中冻结或持久化 provider secret。
+Session 状态的唯一词表是 `PENDING/LAUNCHING/READY/ACTIVE/TERMINATING/TERMINATED/CRASHED`；业务完成、
+取消、超时和失败放在 `terminal_reason`，不再把 `COMPLETED/RUNNING/CANCELLED` 混作 Session status。
 
 ### session_process（具体 CLI 进程代次）
 
@@ -328,12 +400,14 @@ CREATE TABLE invocation (
                           -- PENDING/RUNNING/SEMANTIC_COMPLETED/FAILED/TIMED_OUT/CANCELLING/CANCELLED
     version               BIGINT NOT NULL DEFAULT 0,
     terminal_reason       TEXT,
+    diagnostic_ref        TEXT, -- M1 受限诊断存储引用；只含脱敏 stderr 摘要，不是 Artifact
     started_at            TIMESTAMPTZ,
     semantic_completed_at TIMESTAMPTZ,
     ended_at              TIMESTAMPTZ,
     created_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (session_id, command_id, attempt),
+    UNIQUE (id, session_id),
     FOREIGN KEY (session_id, process_generation)
         REFERENCES session_process(session_id, process_generation)
 );
@@ -341,11 +415,56 @@ CREATE TABLE invocation (
 CREATE INDEX idx_invocation_session ON invocation(session_id, created_at);
 CREATE INDEX idx_invocation_non_terminal ON invocation(status)
     WHERE status NOT IN ('SEMANTIC_COMPLETED','FAILED','TIMED_OUT','CANCELLED');
+CREATE UNIQUE INDEX uq_invocation_one_active_per_session ON invocation(session_id)
+    WHERE status NOT IN ('SEMANTIC_COMPLETED','FAILED','TIMED_OUT','CANCELLED');
 ```
 
 Session 是可跨多轮、可换进程代次的逻辑会话；Invocation 才是一次 user turn 或编排激活。
 `semantic_completed`、`stream_eof`、`process_exited` 和 `transport_disconnected` 分别记录，禁止因为 CLI
 stdout 仍打开而把已经完成的 Invocation 误判为超时，也禁止因为 transport 断开就假定进程死亡。
+
+M1/M2 默认禁止同一 Session 同时存在两个非终态 Invocation。创建 Invocation 的短事务先建立这条唯一的
+active binding，再在提交后调用 `WorkerClient.invoke`；Gateway 收到 `/s/{sessionId}/{protocol}` 请求时只归属
+到该 Session 唯一的非终态 Invocation。没有 active Invocation 时返回 `409 gateway.no_active_invocation`；
+出现多条属于数据损坏，返回 `503 gateway.invocation_binding_corrupt` 并告警，禁止猜“最近的一条”。未来如需
+并发 Invocation，必须升级 URL/header correlation 契约，不能取消此约束后继续靠 sessionId 猜测。
+
+### worker_command（LAUNCH/INVOKE/standalone CANCEL 的 durable claim）
+
+```sql
+CREATE TABLE worker_command (
+    command_id          UUID PRIMARY KEY,
+    kind                TEXT NOT NULL, -- LAUNCH/INVOKE/CANCEL
+    session_id          UUID NOT NULL,
+    process_generation  BIGINT NOT NULL,
+    launch_id           UUID NOT NULL,
+    invocation_id       UUID,
+    payload_hash        TEXT NOT NULL, -- 同 commandId 不允许换 payload
+    commit_state        TEXT,          -- COMMITTED/...；发送前为 NULL
+    result_code         TEXT,
+    result_payload      JSONB,
+    attempt             INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at     TIMESTAMPTZ,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    committed_at        TIMESTAMPTZ,
+    FOREIGN KEY (session_id, process_generation, launch_id)
+        REFERENCES session_process(session_id, process_generation, launch_id),
+    FOREIGN KEY (invocation_id, session_id) REFERENCES invocation(id, session_id)
+);
+
+CREATE INDEX idx_worker_command_retry ON worker_command(next_attempt_at)
+    WHERE commit_state IS NULL;
+CREATE UNIQUE INDEX uq_worker_command_one_launch_per_process
+    ON worker_command(session_id, process_generation, launch_id)
+    WHERE kind = 'LAUNCH';
+```
+
+Session/Invocation 状态变更、`worker_command` claim 和 `domain_event` 在同一短事务提交，之后才做 Worker I/O。
+相同 `commandId` 但 `payload_hash` 不同返回 `409 worker.command_payload_mismatch`。Task 级级联取消仍使用独立
+高优先级 `cancellation_outbox`，但每条 outbox 同时引用一个稳定 command claim。`session_process` 不反向保存
+`launch_command_id`，避免首条 LAUNCH 与进程代次形成不可插入的循环外键；上面的部分唯一索引保证每个代次只有
+一个 LAUNCH claim。
 
 ### worker_event_receipt（控制面事件重放水位）
 
@@ -353,14 +472,17 @@ stdout 仍打开而把已经完成的 Invocation 误判为超时，也禁止因�
 CREATE TABLE worker_event_receipt (
     session_id         UUID NOT NULL REFERENCES session(id),
     process_generation BIGINT NOT NULL,
+    launch_id          UUID NOT NULL,
     last_event_seq     BIGINT NOT NULL DEFAULT 0,
     updated_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (session_id, process_generation)
+    PRIMARY KEY (session_id, process_generation),
+    FOREIGN KEY (session_id, process_generation, launch_id)
+        REFERENCES session_process(session_id, process_generation, launch_id)
 );
 ```
 
 Worker 对每代进程生成从 1 单调递增的 `eventSeq`，本地持久化未确认事件；中心按此表的水位去重、确认
-并在断线后请求重放。业务可见顺序仍使用全局 `domain_event.event_id`，两种序号用途不同。
+并在断线后请求重放。业务可见顺序使用提交后分配的 `event_publication.publication_seq`，两种序号用途不同。
 
 ---
 
@@ -388,8 +510,9 @@ CREATE INDEX idx_session_credential_session
     ON session_credential(session_id, audience);
 ```
 
-创建 session 时分别签发 gateway 与 MCP 两枚独立的 256-bit CSPRNG opaque token；
-只把明文返回给启动方一次。认证时对收到的 token 做 SHA-256 后等值查询，并同时验证
+创建 Session 时只为已启用 audience 签发独立的 256-bit CSPRNG opaque token：M1 只签 gateway，M2 启用
+Platform MCP 后再签 MCP；两者永不复用。明文只进入受保护的 Worker launch 环境一次。认证时对收到的 token
+做 SHA-256 后等值查询，并同时验证
 `session_id`、`worker_id`、`audience`、`expires_at`、`revoked_at`。token 不携带可解析元数据，
 也不复用上游 provider credential。
 
@@ -401,7 +524,7 @@ CREATE INDEX idx_session_credential_session
 CREATE TABLE exchange (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     session_id      UUID NOT NULL REFERENCES session(id),
-    invocation_id   UUID NOT NULL REFERENCES invocation(id),
+    invocation_id   UUID NOT NULL,
     trace_id        UUID NOT NULL,
     -- 请求
     system_prompt   TEXT,               -- full 模式有值，sidecar/none 为 null
@@ -418,6 +541,7 @@ CREATE TABLE exchange (
     cache_read_tokens BIGINT,
     cache_write_tokens BIGINT,
     usd             NUMERIC(12,6),
+    pricing_snapshot JSONB,             -- 计算时使用的 pricing id/version/rates/currency；usage 缺失时可空
     latency_ms      INTEGER,
     streamed        BOOLEAN,
     stop_reason     TEXT,
@@ -427,7 +551,9 @@ CREATE TABLE exchange (
     recording_gap_reason TEXT,   -- queue_overflow/storage_failure/parse_failure（partial/failed 时必填）
     -- 时间
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    FOREIGN KEY (invocation_id, session_id)
+        REFERENCES invocation(id, session_id)
 );
 
 CREATE INDEX idx_exchange_session_id ON exchange(session_id);
@@ -438,6 +564,9 @@ CREATE INDEX idx_exchange_trace_id ON exchange(trace_id);
 请求头解析完成后先插入 exchange；流结束、客户端断开或转发失败时更新响应、token、延迟和
 `recording_status`，因此 exchange 是受控更新的调用聚合，不是 immutable event。
 `recording_status='complete'` 时 `recording_gap_reason` 必须为 `NULL`；`partial/failed` 时必须有原因。
+Anthropic usage 只提供 token，不提供美元账单；`usd` 必须用 Session 选择的 `provider_pricing` 计算，并把
+实际 rates/version/currency 冻结进 `pricing_snapshot`。找不到有效 pricing 时 token 仍可记录，但 `usd` 和
+snapshot 保持 NULL，API/UI 显示“成本未知”，禁止使用当前价格回填历史记录或声称精确成本。
 
 ---
 
@@ -448,6 +577,7 @@ CREATE TABLE artifact (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     session_id      UUID NOT NULL REFERENCES session(id),
     task_id         UUID REFERENCES task(id),               -- NULL in M1; NOT NULL enforced in M2
+    command_id      UUID,                  -- MCP/工具创建时的稳定幂等键；系统内部导入可空
     type            TEXT NOT NULL,      -- code_change / document / test_result / ...
     status          TEXT NOT NULL DEFAULT 'PENDING_UPLOAD',
                                     -- PENDING_UPLOAD/AVAILABLE/UPLOAD_FAILED/DELETED
@@ -459,7 +589,10 @@ CREATE TABLE artifact (
     metadata        JSONB NOT NULL DEFAULT '{}',
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    deleted_at      TIMESTAMPTZ
+    deleted_at      TIMESTAMPTZ,
+    UNIQUE (session_id, command_id),
+    UNIQUE (id, task_id),
+    FOREIGN KEY (session_id, task_id) REFERENCES session(id, task_id)
 );
 
 CREATE INDEX idx_artifact_session_id ON artifact(session_id);
@@ -477,7 +610,7 @@ CREATE INDEX idx_artifact_cleanup ON artifact(status, created_at);
 ```sql
 CREATE TABLE artifact_reference (
     artifact_id        UUID NOT NULL REFERENCES artifact(id),
-    referrer_type      TEXT NOT NULL, -- checkpoint/inbox/operation_log/memory_card/domain_event
+    referrer_type      TEXT NOT NULL, -- checkpoint/task_goal/a2a/inbox/operation_log/memory_card/domain_event
     referrer_id        TEXT NOT NULL,
     created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (artifact_id, referrer_type, referrer_id)
@@ -496,14 +629,13 @@ CREATE INDEX idx_artifact_reference_referrer
 ```sql
 CREATE TABLE a2a_message (
     id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    idempotency_key     TEXT NOT NULL UNIQUE,        -- 幂等键，格式 {traceId}:{spanId}
+    command_id          UUID NOT NULL,
     task_id             UUID REFERENCES task(id),    -- NULL in M1
     from_session_id     UUID NOT NULL REFERENCES session(id),
     to_agent_role       TEXT NOT NULL,
     to_session_id       UUID REFERENCES session(id), -- 初始可空，目标 Session 创建后回填
     kind                TEXT NOT NULL,  -- request / consult / notify / escalate
     content             TEXT NOT NULL,
-    artifact_ids        JSONB NOT NULL DEFAULT '[]',
     downgraded_from     TEXT,           -- 被降级前的原始 kind
     -- trace（签发后不可变快照，不只存在内存）
     trace_id            UUID NOT NULL,
@@ -519,12 +651,30 @@ CREATE TABLE a2a_message (
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     delivered_at        TIMESTAMPTZ,
-    acknowledged_at     TIMESTAMPTZ
+    acknowledged_at     TIMESTAMPTZ,
+    UNIQUE (from_session_id, command_id),
+    UNIQUE (trace_id, span_id),
+    UNIQUE (id, task_id),
+    FOREIGN KEY (from_session_id, task_id) REFERENCES session(id, task_id),
+    FOREIGN KEY (to_session_id, task_id) REFERENCES session(id, task_id)
 );
 
 CREATE INDEX idx_a2a_trace_id ON a2a_message(trace_id);
 CREATE INDEX idx_a2a_from_session ON a2a_message(from_session_id);
+
+CREATE TABLE a2a_message_artifact (
+    message_id      UUID NOT NULL,
+    artifact_id     UUID NOT NULL,
+    task_id         UUID NOT NULL REFERENCES task(id),
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (message_id, artifact_id),
+    FOREIGN KEY (message_id, task_id) REFERENCES a2a_message(id, task_id) ON DELETE CASCADE,
+    FOREIGN KEY (artifact_id, task_id) REFERENCES artifact(id, task_id)
+);
 ```
+
+API/MCP 中的 `artifactIds` 是 `a2a_message_artifact` 的投影，不在 JSONB 中保存无法约束的外键。创建关联时
+同事务写 `artifact_reference(referrer_type='a2a_message')`，消息删除/归档策略必须同步维护引用。
 
 ---
 
@@ -551,11 +701,23 @@ CREATE TABLE inbox_item (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     resolved_at     TIMESTAMPTZ,
-    escalated_at    TIMESTAMPTZ
+    escalated_at    TIMESTAMPTZ,
+    FOREIGN KEY (task_id, workspace_id) REFERENCES task(id, workspace_id),
+    FOREIGN KEY (session_id, workspace_id) REFERENCES session(id, workspace_id)
 );
 
 CREATE INDEX idx_inbox_workspace_status ON inbox_item(workspace_id, status);
+
+CREATE TABLE inbox_item_artifact (
+    inbox_item_id   UUID NOT NULL REFERENCES inbox_item(id) ON DELETE CASCADE,
+    artifact_id     UUID NOT NULL REFERENCES artifact(id),
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (inbox_item_id, artifact_id)
+);
 ```
+
+Inbox `actions` 只保存动作定义，不内嵌 Artifact ID；证据列表来自 `inbox_item_artifact`，并在同事务写
+`artifact_reference(referrer_type='inbox_item')`。
 
 ---
 
@@ -565,7 +727,7 @@ CREATE INDEX idx_inbox_workspace_status ON inbox_item(workspace_id, status);
 CREATE TABLE operation_log (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     session_id      UUID NOT NULL REFERENCES session(id),
-    invocation_id   UUID NOT NULL REFERENCES invocation(id),
+    invocation_id   UUID NOT NULL,
     task_id         UUID REFERENCES task(id),
     command_id      UUID NOT NULL,
     tool_name       TEXT NOT NULL,
@@ -575,13 +737,16 @@ CREATE TABLE operation_log (
     tool_result     JSONB,
     external_operation_id TEXT,
     -- 文件操作快照（写操作前的内容）
-    snapshot_ref    TEXT,               -- 对象存储路径，内容是操作前文件内容
+    snapshot_artifact_id UUID REFERENCES artifact(id), -- 操作前内容也是可寻址、受引用保护的 Artifact
     file_path       TEXT,
     -- 时间
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     committed_at    TIMESTAMPTZ,
-    UNIQUE (session_id, command_id)
+    UNIQUE (session_id, command_id),
+    FOREIGN KEY (session_id, task_id) REFERENCES session(id, task_id),
+    FOREIGN KEY (invocation_id, session_id) REFERENCES invocation(id, session_id),
+    FOREIGN KEY (snapshot_artifact_id, task_id) REFERENCES artifact(id, task_id)
 );
 
 CREATE INDEX idx_oplog_session_id ON operation_log(session_id);
@@ -606,6 +771,7 @@ CREATE TABLE cancellation_outbox (
     session_id          UUID NOT NULL REFERENCES session(id), -- 每个目标 session 一条命令
     worker_id           TEXT NOT NULL REFERENCES worker(id),
     launch_id           UUID NOT NULL,
+    command_id          UUID NOT NULL UNIQUE REFERENCES worker_command(command_id),
     cancellation_version BIGINT NOT NULL,            -- Task 取消请求代次
     process_generation  BIGINT NOT NULL,             -- 目标进程代次快照
     status              TEXT NOT NULL DEFAULT 'PENDING',
@@ -657,11 +823,11 @@ Worker 仅在命令的 `process_generation` 和 `launch_id` **都等于**本地�
 
 ---
 
-### domain_event（持久化领域事件，SSE Last-Event-ID 续传和事件排序依赖此表）
+### domain_event / event_publication（持久化事件与提交后可见顺序）
 
 ```sql
 CREATE TABLE domain_event (
-    event_id        BIGSERIAL PRIMARY KEY,           -- 单调递增，不用时间戳排序（多机时钟漂移）
+    event_id        BIGSERIAL PRIMARY KEY,           -- 数据库内部 ID；不承诺等于事务提交顺序
     aggregate_type  TEXT NOT NULL,                   -- session / task / a2a_message / ...
     aggregate_id    UUID NOT NULL,
     trace_id        UUID,
@@ -673,8 +839,24 @@ CREATE TABLE domain_event (
 
 CREATE INDEX idx_domain_event_aggregate ON domain_event(aggregate_type, aggregate_id);
 CREATE INDEX idx_domain_event_trace ON domain_event(trace_id);
--- SSE 断线重连用 Last-Event-ID（= event_id），按此顺序续传
+
+CREATE TABLE event_publication (
+    publication_seq BIGSERIAL PRIMARY KEY,           -- SSE 唯一可见顺序
+    event_id         BIGINT UNIQUE REFERENCES domain_event(event_id) ON DELETE SET NULL,
+    published_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 ```
+
+PostgreSQL sequence 值在事务回滚时不会回收，也不等于事务提交顺序：事务 A 可先取得 `event_id=10` 后提交，
+事务 B 可取得 11 后先提交。因此 SSE **禁止**直接把 `domain_event.event_id` 当 cursor，否则客户端看见 11 后
+可能永久漏掉稍后提交的 10。
+
+M1 使用单一 `EventPublicationService`：它持有 Postgres advisory lock，只扫描已经提交且尚未发布的
+`domain_event`，按稳定批次插入 `event_publication`。只有 `publication_seq` 才写入 SSE `id` 和 snapshot
+`eventWatermark`。发布器故障只造成事件暂未推送；REST snapshot 仍从聚合表读取真相，发布器恢复后继续。
+任何多实例实现都必须保持单 publisher lease，不能让两个发布事务并发分配可见序号。
+`event_publication` 是轻量 cursor tombstone，保留时间长于 `domain_event`；事件按保留策略删除后 `event_id`
+置空但 publication sequence 不复用。客户端 cursor 落入已删除区间时收到 `cursor.expired` 并拉 snapshot。
 
 ---
 
@@ -685,6 +867,8 @@ CREATE TABLE checkpoint_execution (
     id                      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     task_id                 UUID NOT NULL REFERENCES task(id),
     checkpoint_id           TEXT NOT NULL,           -- 对应 Task.checkpoints[].id
+    submitted_by_session_id UUID NOT NULL REFERENCES session(id),
+    command_id              UUID NOT NULL,
     status                  TEXT NOT NULL DEFAULT 'PENDING',  -- PENDING/VERIFYING/PASSED/FAILED
     evidence_artifact_id    UUID REFERENCES artifact(id),     -- agent 提交的 Evidence
     attempt                 INTEGER NOT NULL DEFAULT 1,
@@ -692,9 +876,30 @@ CREATE TABLE checkpoint_execution (
     notes                   TEXT,
     created_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (task_id, checkpoint_id, attempt)
+    UNIQUE (task_id, checkpoint_id, attempt),
+    UNIQUE (submitted_by_session_id, command_id),
+    FOREIGN KEY (submitted_by_session_id, task_id) REFERENCES session(id, task_id),
+    FOREIGN KEY (evidence_artifact_id, task_id) REFERENCES artifact(id, task_id)
+);
+
+CREATE TABLE task_goal_verification (
+    id                      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    task_id                 UUID NOT NULL REFERENCES task(id),
+    status                  TEXT NOT NULL DEFAULT 'VERIFYING', -- VERIFYING/PASSED/FAILED
+    evidence_artifact_id    UUID NOT NULL,
+    verifier                TEXT NOT NULL, -- deterministic rule / trusted verifier profile + version
+    verification_result     JSONB NOT NULL,
+    attempt                 INTEGER NOT NULL DEFAULT 1,
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (task_id, attempt),
+    FOREIGN KEY (evidence_artifact_id, task_id) REFERENCES artifact(id, task_id)
 );
 ```
+
+Task 只能在同一状态转换事务中确认存在 `PASSED` 的最新 `task_goal_verification` 后进入 `SUCCEEDED`。Goal
+验证引用与 `artifact_reference(referrer_type='task_goal_verification')` 同事务创建，不能只在 domain event
+payload 或 Task JSONB 里放一个裸 artifactId。
 
 ---
 
@@ -707,6 +912,13 @@ Invocation/A2A/Artifact/Inbox/Outbox 的 status、observability level、recordin
 ```sql
 ALTER TABLE invocation ADD CONSTRAINT chk_invocation_status CHECK (status IN
   ('PENDING','RUNNING','SEMANTIC_COMPLETED','FAILED','TIMED_OUT','CANCELLING','CANCELLED'));
+ALTER TABLE session ADD CONSTRAINT chk_session_status CHECK (status IN
+  ('PENDING','LAUNCHING','READY','ACTIVE','TERMINATING','TERMINATED','CRASHED'));
+ALTER TABLE session ADD CONSTRAINT chk_session_terminal_reason CHECK (
+  (status IN ('TERMINATED','CRASHED') AND terminal_reason IS NOT NULL AND ended_at IS NOT NULL)
+  OR (status NOT IN ('TERMINATED','CRASHED') AND terminal_reason IS NULL AND ended_at IS NULL));
+ALTER TABLE session ADD CONSTRAINT chk_session_process_reuse_policy CHECK
+  (process_reuse_policy IN ('STREAMING_STDIN','RESUME_PER_INVOCATION'));
 ALTER TABLE session_credential ADD CONSTRAINT chk_session_credential_audience
   CHECK (audience IN ('gateway','mcp'));
 ALTER TABLE task ADD CONSTRAINT chk_task_not_own_parent CHECK (parent_task_id IS NULL OR parent_task_id <> id);
@@ -774,8 +986,11 @@ V001 的可执行建表顺序：
 
 ```text
 workspace
+→ admin_bootstrap_credential
+→ admin_session
 → workspace_root
 → provider_route
+→ provider_pricing
 → agent_profile
 → agent_profile_version
 → worker
@@ -786,21 +1001,27 @@ workspace
 → session
 → session_process
 → invocation
+→ worker_command
 → worker_event_receipt
 → session_credential
 → exchange
 → artifact
 → artifact_reference
 → a2a_message
+→ a2a_message_artifact
 → inbox_item
+→ inbox_item_artifact
 → operation_log
 → checkpoint_execution
+→ task_goal_verification
 → cancellation_outbox
 → domain_event
+→ event_publication
 ```
 
-M1 **只使用** Workspace Root、Provider Route、Profile、Worker/Worker Credential、standalone Session、
-Session Process、Invocation、Worker Event Receipt、Session Credential、Exchange、Artifact 和 Domain Event；
+M1 **只使用**本地管理认证、Workspace Root、Provider Route/Pricing、Profile、Worker/Worker Credential、
+standalone Session、Session Process、Invocation、Worker Command、Worker Event Receipt、Session Credential、
+Exchange、Domain Event 和 Event Publication；
 Task/A2A/Inbox/Checkpoint 表已存在但没有应用入口。M2 开启编排入口后才写入这些表。
 `session.task_id` 和 `artifact.task_id` 永久允许为空，以支持 standalone session；M2 创建的编排记录
 由应用服务验证其非空。不存在“先引用未来表、以后再补目标表”的 migration 状态。

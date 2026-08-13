@@ -115,13 +115,34 @@ reviewer 刻意使用与 coder 不同厂商的模型：Claude 监察 Claude 可�
 
 **防通知疲劳**：同一类约束在 24 小时内触发超过 3 次，向你发一条"建议调整 agent 配置"的提示，**不自动改变处置方式**。系统偷偷改行为会导致信任丧失——用户不明白为什么任务突然开始被直接终止而不是等待批准。
 
+约束能否在执行前阻断，取决于 Adapter 的工具治理能力，不能因为 Gateway 看见了 tool call 就宣称已经拦截：
+
+| 能力 | 含义 | 可提供的保证 |
+|---|---|---|
+| `OBSERVE_ONLY` | 只能从输出/转录观察工具调用 | 事后审计，不能承诺阻止副作用 |
+| `HOOK_ENFORCED` | CLI 提供同步 PreToolUse/permission hook，Hearth 返回 allow/deny | hook 覆盖范围内 fail-closed |
+| `BROKERED` | 工具必须通过 Hearth MCP/工具代理执行 | claim、白名单、快照和执行同一受控链路 |
+| `SANDBOX_ENFORCED` | OS/container policy 限制文件、进程、网络和凭证 | 即使 agent 绕过工具协议也受边界限制 |
+
+Profile 的 `auto_terminate`/`suspend_wait` 只有在目标 Worker+Adapter 对该工具至少达到 `HOOK_ENFORCED`
+或 `BROKERED` 时才能启动；否则 preflight 返回 `worker.tool_policy_not_enforceable`。`OBSERVE_ONLY` Session
+必须在 UI 显示“仅审计”，且高风险写操作 Profile 默认拒绝运行。
+
+Claude Code 的远程 HTTP hook 在连接失败/非 2xx 时可能继续执行，不能单独作为 fail-closed 边界。
+`HOOK_ENFORCED` 必须使用 Worker 本地受审 hook wrapper：同步询问本地 policy endpoint，allow 才放行；超时、
+中心断线、响应无法解析时按 deny 的 hook 协议退出。对应 CLI 版本和每类工具 decision 字段必须有黄金样本
+contract test；没有通过时能力自动降为 `OBSERVE_ONLY`。
+
 ### Planner 反馈回路
 
 任务完成后，评估 agent 给这次拆解打分，分数和拆法进 L2 记忆。下次 planner 遇到类似任务，检索到历史拆法作为参考。不做这个，planner 永远不进化。
 
 ### Undo 机制
 
-agent 每次调用工具前，编排层记一条操作日志，对于文件写入操作保存操作前的内容快照。任务被 `auto_terminate` 后，Inbox 条目里包含"需要手动撤销的操作清单"。不做自动回滚（复杂且容易出错），但提供清单让你知道要手动撤销什么。
+对于 `HOOK_ENFORCED`/`BROKERED` 工具，执行前由受信 Adapter/工具代理用稳定 `commandId` 写 operation claim；
+文件写入前把旧内容保存为真正的 Artifact，并在 `operation_log.snapshot_artifact_id` 引用。`OBSERVE_ONLY`
+只能记录事后 observation，不得伪装为执行前日志。任务被 `auto_terminate` 后，Inbox 条目里包含“需要手动撤销
+的操作清单”。不做自动回滚，但提供清单让用户核验和处理。
 
 ---
 
@@ -234,6 +255,9 @@ Worker 守护进程（`hearth-worker` 独立启动）职责：
 - 保持 WebSocket 长连接，等待 launch/cancel 指令
 - 每 30s 发心跳
 - 重连后上报本地存活 session 列表（状态对账）
+
+Adapter 首期为 Claude Code；Codex/Gemini/opencode 后续按同一命令与工具治理契约接入，Pi 使用 RPC JSONL
+Adapter。Adapter 能吐事件不等于能执行权限策略，能力等级必须分别上报。
 
 详见 `docs/12-worker.md`。
 

@@ -17,7 +17,7 @@
 | Checkpoint 等待 | 10min | 按 Task.correction.onCheckpointFail 处置 |
 | Inbox suspend_wait（ephemeral 任务） | 24h 发二次提醒，72h 自动取消 | → CANCELLED |
 | Inbox suspend_wait（durable 任务） | 永不自动取消，24h 发提醒 | 等人处理 |
-| 强制停机等待 | SIGTERM 后 8s，随后 SIGKILL；总终止确认 ≤10s | 仍无法确认则保持 CANCELLING 并告警 |
+| 强制停机等待（Worker ONLINE/可达） | SIGTERM 后 8s，随后 SIGKILL；总终止确认 ≤10s | 仍无法确认则保持 CANCELLING 并告警 |
 | Worker 心跳超时 | 90s 无心跳 → Worker 标记 OFFLINE | 该 Worker 的 session 进 Inbox |
 
 ---
@@ -44,7 +44,8 @@ base = 1s，max = 30s，最多 3 次
 
 | 操作 | 幂等机制 |
 |---|---|
-| A2A 消息投递 | `messageId` 作为幂等键，接收方 upsert |
+| A2A 创建 | 调用 Session 生成稳定 `commandId`，`(from_session_id, command_id)` 唯一，重试返回原 messageId |
+| A2A 投递 | 已创建消息的 `messageId` 作为接收幂等键，接收方 upsert |
 | 有副作用的工具/IM 操作 | 调用前持久化 claim；稳定 `commandId` 跨重试复用，返回已提交结果 |
 | Invocation 启动 | `(session_id, command_id, attempt)` 唯一，只有 CAS winner 可发 LAUNCH/CONTINUE |
 | 任务触发 | `triggerKey = hash(来源 + 内容摘要 + 分钟级时间窗)`，同窗口去重 |
@@ -65,7 +66,7 @@ PLANNING
   → RUNNING（拆解完成，分配给 agent）
   → FAILED（拆解失败，无法开始）
 RUNNING
-  → AWAITING_HUMAN（suspend_wait 触发 / 预算 80% 预警 / escalate）
+  → AWAITING_HUMAN（suspend_wait 触发 / 预算达到 100% / escalate）
   → SUCCEEDED（所有 checkpoint 通过，Goal 验证通过）
   → FAILED（不可恢复错误，超重试上限）
   → TIMED_OUT（超过运行时限）
@@ -103,6 +104,12 @@ transport_disconnected  Worker 或本地事件 transport 断开
 
 `semantic_completed` 到达后 Invocation 可以终态，即使可复用 CLI 进程与 stdout 仍存活；transport 断开只触发
 reconcile，不能立即假定进程死亡。UI 的“正在执行”以 Invocation 为准，不以 Session 进程是否存活为准。
+
+创建 Invocation 的短事务同时执行 `Session READY → ACTIVE`、插入 PENDING Invocation、durable
+`worker_command` 和 domain event；提交后发送 INVOKE。语义完成/失败/超时的 CAS winner 写 Invocation 终态，
+若 `STREAMING_STDIN` 同代进程仍可复用，或 `RESUME_PER_INVOCATION` 已正常保存 ResumeDescriptor 并退出，
+则同时执行 `Session ACTIVE → READY`；只有异常退出/无法建立连续性时才进入 `TERMINATING/CRASHED`。因此
+Session 状态与“是否正在回复”保持一致，但 UI 仍以非终态 Invocation 作最终判断。
 
 ### A2A 消息
 
@@ -143,8 +150,13 @@ durable            永不自动取消，必须人工处理。
 
 **M2 验收含义**（精确定义，不是模糊的"10s内生效"）：
 - cancel 指令 **accepted**：≤ 1s
-- 进程确认终止：SIGTERM 后等 8s，超时 SIGKILL，**≤ 10s**
+- Worker 为 ONLINE 且控制通道可达时，进程确认终止：SIGTERM 后等 8s，超时 SIGKILL，**≤ 10s**
 - Task 标记 CANCELLED：进程终止后 ≤ 1s
+
+网络分区时中心不可能证明远端 PID 已在 10s 内死亡。此时仍必须在 ≤1s 内持久化取消、撤销 gateway/MCP
+capability（阻止新的模型/MCP 调用）、Task 保持 `CANCELLING` 并告警；Worker 重连后第一优先级执行 durable
+cancel，再确认进程死亡。若未来要求“网络分区也必须 10s 杀进程”，必须引入 ≤10s Worker execution lease，
+并接受短暂断网会杀掉所有进程；该策略与当前“断线继续运行”不能同时成立。
 
 ```
 1. 数据库事务中锁 Task：`cancellation_version + 1`、Task → CANCELLING，
@@ -189,7 +201,7 @@ durable            永不自动取消，必须人工处理。
 
 ## 进程崩溃检测
 
-控制面每 30s 检查每个 RUNNING session 对应的进程是否存活：
+控制面每 30s 检查每个 `READY/ACTIVE/LAUNCHING` Session 当前进程代次是否存活：
 - 本机：`process.isAlive()`
 - 远机：Worker 心跳（见 `12-worker.md`）
 
@@ -216,10 +228,11 @@ Hearth 中心重启后，Postgres 里可能有非终态的任务。
 启动流程：
 1. Flyway migration（先于任何业务逻辑）
 2. 恢复扫描（扫全部非终态 Task/Session/Invocation）：
-   READY / ACTIVE / LAUNCHING → 查 Worker 在线状态 + `(sessionId, processGeneration)` 进程身份
+   当前 session_process 为 LAUNCHING/ALIVE/TERMINATING → 查 Worker 在线状态 + `(sessionId, processGeneration)` 进程身份
      ├─ Worker 在线 + 同代进程存活 → 按 worker_event_receipt.last_event_seq 重放事件并继续监控
      ├─ Worker 在线 + 同代进程已死 → Session → CRASHED；非终态 Invocation 补写 FAILED
      └─ Worker 离线             → Session 保持待对账并显示 STALE；超过恢复期限才标 CRASHED
+   READY + RESUME_PER_INVOCATION + 当前无存活进程 → 正常可恢复状态，不标 CRASHED
    非终态 Invocation           → 检查 semantic completion/进程/事件水位，terminal reconciler 只写一个终态
    AWAITING_HUMAN               → 保持不动，人还没回复；所有自动执行入口继续受 gate 拦截
    CANCELLING                   → 继续执行取消流程（重发 SIGTERM）
@@ -228,7 +241,9 @@ Hearth 中心重启后，Postgres 里可能有非终态的任务。
 ```
 
 恢复扫描是阻塞启动的（不完成不接新请求），目的是保证对外可见的状态是一致的。
-扫描超时（默认30s）则继续启动，受影响的任务标 `CRASHED`。
+扫描超时（默认30s）则继续启动，但受影响 Session 保持非终态并在 API/UI 投影为 `STALE`，禁止杜撰终态；
+超过可配置 recovery grace period 后，确认无法对账的 Session 才转 `CRASHED`，有关 Task 按 correction
+进入 `AWAITING_HUMAN` 或 `FAILED`。`STALE` 是新鲜度投影，不是持久化 Session status。
 
 ---
 
@@ -304,8 +319,10 @@ agent 读到后能重新锚定任务目标。
 
 ---
 
-事件顺序用 Postgres sequence 生成的单调递增 ID，**不用时间戳排序**。
-原因：多机环境时钟漂移会造成乱序。时间戳只用于展示和超时计算。
+事件先随聚合状态提交为 `domain_event`，再由单 publisher 为已提交事件分配单调递增的
+`event_publication.publication_seq`；UI/SSE 只按 publication sequence 排序，**不用时间戳排序，也不直接把
+BIGSERIAL event_id 当提交顺序**。原因：多机时钟会漂移，而 PostgreSQL sequence 的分配顺序也不等于事务
+提交顺序。时间戳只用于展示和超时计算。
 
 `wallMs` 预算的计量：用 Session 开始和结束的时间差（中心时钟），不用 Worker 本地时钟。
 
@@ -315,7 +332,9 @@ agent 读到后能重新锚定任务目标。
 
 所有链路统一传播 `traceId`：
 - 应用日志：MDC 注入 `traceId`，每条日志都带
-- HTTP 请求：请求头 `X-Trace-Id: {traceId}`（网关转发给上游时也带）
+- Hearth 内部 HTTP/WebSocket：请求头或 envelope 携带 `X-Trace-Id: {traceId}`
+- Provider 上游：默认剥离 `X-Trace-Id` 等 Hearth 内部头，Gateway 通过本地 Exchange 关联追踪；只有
+  provider route 明确声明并测试过的 vendor metadata 字段才可发送，避免泄露内部拓扑标识
 - A2A 消息：TraceContext 已含 traceId
 - Worker 日志：Worker 向中心上报日志时带 traceId
 

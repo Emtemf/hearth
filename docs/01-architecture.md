@@ -64,8 +64,15 @@ Hearth 把它们拆成两个**正交平面**，各自独立演进、独立失败
 CLAUDE_CONFIG_DIR=~/.hearth/sessions/{sessionId}/.claude \
 ANTHROPIC_BASE_URL=http://127.0.0.1:4517/s/{sessionId}/anthropic \
 ANTHROPIC_AUTH_TOKEN={gatewayCapabilityToken} \
-claude --project-dir {workDir}
+claude -p --input-format stream-json --output-format stream-json --verbose \
+  --replay-user-messages --session-id {sessionId}
 ```
+
+cwd 不通过不存在或版本易变的 `--project-dir` 参数传递；`LocalWorkerClient` 使用
+`ProcessBuilder.directory(validatedCwd)`，远程 Worker 使用等价的无 shell 工作目录设置。
+Prompt 通过 NDJSON stdin 发送，不进入 argv。Adapter contract test 必须针对锁定的 Claude Code 版本验证
+第二条输入能否在 result 事件后继续复用同一进程；不能复用时采用“每 Invocation 新进程 + 带版本 resume”策略，
+但逻辑 Session ID 不变，禁止假设所有 CLI 都是长驻进程。
 
 每个 session 的 overlay 目录结构：
 ```
@@ -75,8 +82,15 @@ claude --project-dir {workDir}
     _platform.md     ← 平台约束（约束检查、G4C+E 规范）
     _task.md         ← 本次任务专属规则
   settings.json      ← hooks（串联用户原有 hooks）
-.mcp.json            ← 注入 Hearth MCP Server
+  hearth-mcp.json    ← M2 生成的 session 专属 MCP 配置，不写入项目目录
 ```
+
+M2 启用 Platform MCP 时，Claude Code Adapter 追加
+`--strict-mcp-config --mcp-config {overlay}/hearth-mcp.json`。Overlay compiler 把 Profile 允许的用户 MCP 与
+Hearth MCP 合并后生成该文件；`--strict-mcp-config` 防止项目 `.mcp.json` 或用户配置绕过工具白名单。文件
+权限为 0600，Session 终止时撤销 token 并删除。M1 不启用 MCP，不传这两个参数。
+内置工具另由锁定版本支持的 `--tools`/`--disallowedTools` 和本地 fail-closed hook wrapper 双层约束；MCP
+strict config 不能替代 Bash/Edit/Read 等内置工具治理。
 
 
 
@@ -91,6 +105,12 @@ http://127.0.0.1:4517/s/{sessionId}/gemini
 理由：所有 CLI 都支持带路径的 base_url，但对自定义 header 的支持参差不齐
 （Claude Code 有 `ANTHROPIC_CUSTOM_HEADERS`，Codex 有 `http_headers`，Gemini CLI 没有）。
 路径法是唯一对四家都成立的归因手段，且天然抗并发——多个 agent 同时跑不会串。
+
+Base URL 后仍会追加 provider API path。M1 的 Anthropic protocol handler 只允许经过 contract test 的
+`POST /v1/messages` 和 `POST /v1/messages/count_tokens`（以及明确加入 allowlist 的后续路径），拒绝 path
+traversal、重复编码、未知 method/path 和把绝对 URL 塞进 path。Messages 请求创建 Exchange；纯 token-count
+调用记录为 protocol diagnostic/usage probe，不伪装成一次模型 Exchange。上游目标始终由 provider route
+重建，不能把入站 Host/path 原样拼接成任意 URL。
 
 ### 会话级模型路由：M1 只做同协议路由
 
@@ -115,7 +135,7 @@ http://127.0.0.1:4517/s/{sessionId}/gemini
 
 | 等级 | 机制 | 拿得到 | 拿不到 | 计费 |
 |---|---|---|---|---|
-| `full` | 全代理，流量过网关 | system prompt 全文、tools 定义、全量 messages、精确 token/成本 | — | API |
+| `full` | 全代理，流量过网关 | system prompt 全文、tools 定义、全量 messages、精确 token；配置版本化 pricing 时计算成本 | — | API |
 | `sidecar` | Claude Code hooks（`UserPromptSubmit`/`PreToolUse`/`PostToolUse`/`Stop`）+ 读 `~/.claude/projects/*.jsonl` 转录 | 用户输入、助手输出、工具调用与结果、**准确 token/成本**（转录文件实测确认） | system prompt 全文、tools schema | 订阅 |
 | `none` | 仅控制面生命周期 | 开始/结束/退出码 | 其余全部 | 订阅 |
 
@@ -151,7 +171,12 @@ exchange 表中用 `recording_status` + `recording_gap_reason` 字段记录，�
 
 - Java 实现：读响应 `InputStream` 时，`write` 同时到客户端 `OutputStream` 和录制缓冲，用虚拟线程做阻塞 IO，代码直白无 DataBuffer 泄漏风险
 - 录制管线必须是**异步且失败不影响转发**——录制炸了就丢观测，绝不阻断 agent（用独立线程 + 有界队列，队列满直接丢弃而不是阻塞）
-- 不做完整 SSE 聚合后再转发；逐行边转边解析（SSE 是 `data: ...\n\n` 行协议，单行即可解析）
+- 不做完整 SSE 聚合后再转发；解析器必须跨任意网络 chunk 增量解码 UTF-8，支持 CRLF、注释、一个事件
+  多个 `data:` 行和事件大小上限，不能假设一次 read 或一行就是一个完整事件
+- 转发侧在完整 SSE event 边界主动 `flush()`；对尚未形成事件的长 chunk 设置最大 flush interval，避免
+  Servlet/container 缓冲造成可见延迟
+- 请求默认硬上限 32 MiB；≤1 MiB 可内存缓冲，超过后 spool 到权限 0600 的临时文件并在 finally 删除，
+  禁止无限读取完整 history 直到 OOM
 - 背压：录制侧消费慢时队列满丢弃，而不是拖慢转发侧
 
 ---
@@ -181,7 +206,8 @@ Exchange    Invocation 内一次模型 API 调用
 
 控制面必须分别处理 `semantic_completed`、`stream_eof`、`process_exited`、`transport_disconnected`。
 收到语义完成事件即可结束 Invocation；不能等待长驻 CLI 的 stdout 关闭。Worker 事件使用
-`(sessionId, processGeneration, eventSeq)` 重放，中心再转换成全局 `domain_event.event_id`。
+`(sessionId, processGeneration, eventSeq)` 重放，中心持久化 `domain_event`，再由单 publisher 在提交后分配
+全局可见的 `event_publication.publication_seq`。
 
 ---
 

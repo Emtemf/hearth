@@ -1,6 +1,6 @@
 # Platform MCP Server：工具定义
 
-Hearth 自己跑一个 MCP Server，注入每个 agent session 的 `.mcp.json`。
+Hearth 自己跑一个中心 Platform MCP Server，并为每个 agent session 生成独立的受保护 MCP overlay 配置。
 这是 agent 参与平台编排的唯一正式通路——所有 A2A 派发、Artifact 上传、记忆检索、
 Checkpoint 上报、问题上报都走这里。
 
@@ -10,6 +10,11 @@ Evidence 无法落地，G4C+E 框架退化成形式。
 ---
 
 ## 工具列表
+
+Platform MCP 从 M2 启用。M2 注册 `hearth_dispatch_a2a`、`hearth_save_artifact`、
+`hearth_checkpoint_done`、`hearth_get_task_context`；M3 在 memory application port 可用后才注册
+`hearth_retrieve_memory`。未到里程碑的工具不出现在 `tools/list`，不能注册一个永远返回 feature disabled 的
+假工具。M1 不启动 MCP endpoint，也不签发 MCP audience token。
 
 ### `hearth_dispatch_a2a`
 
@@ -107,8 +112,13 @@ Evidence 无法落地，G4C+E 框架退化成形式。
   "description": "保存产出物（代码变更、测试报告、文档等）并获得一个可被其他 agent 引用的 artifactId。",
   "inputSchema": {
     "type": "object",
-    "required": ["type", "content"],
+    "required": ["commandId", "type", "content"],
     "properties": {
+      "commandId": {
+        "type": "string",
+        "format": "uuid",
+        "description": "调用方生成的稳定幂等键；网络重试必须复用"
+      },
       "type": {
         "type": "string",
         "enum": ["code_change", "document", "test_result", "screenshot", "plan", "review", "command_output"],
@@ -116,7 +126,7 @@ Evidence 无法落地，G4C+E 框架退化成形式。
       },
       "content": {
         "type": "string",
-        "description": "内容本体（M1 只接受内容，不接受主机 path；< 1MB 直接内嵌，>= 1MB 走分块上传）"
+        "description": "内容本体（M2 首期只接受内容，不接受主机 path；UTF-8 后最大 1 MiB）"
       },
       "title": {
         "type": "string",
@@ -135,16 +145,17 @@ Evidence 无法落地，G4C+E 框架退化成形式。
 ```json
 {
   "artifactId": "art-abc123",
-  "url": "/api/artifacts/art-abc123",
+  "url": "/api/v1/artifacts/00000000-0000-0000-0000-000000000000",
   "sizeBytes": 4821
 }
 ```
 
 ---
 
-M1 不提供 path 参数，防止 agent 把 allowed workspace 之外的主机文件上传。未来增加 path 上传时，必须由
-Worker 对 `session cwd + relative path` 做 real-path canonicalization、符号链接逃逸检查和文件大小上限；
-分块上传使用 uploadId、chunk hash、总 sha256 和幂等 finalize。
+M2 首期不提供 path 参数，防止 agent 把 allowed workspace 之外的主机文件上传。内容小于 64 KiB 可存
+Postgres，64 KiB–1 MiB 写本地 Artifact storage。未来增加 path/大文件上传时，必须由 Worker 的受限
+`ArtifactUploadRelay` 对 `session cwd + relative path` 做 real-path canonicalization、符号链接逃逸检查和
+文件大小上限；分块上传使用 uploadId、chunk hash、总 sha256 和幂等 finalize。
 
 ---
 
@@ -159,8 +170,13 @@ Worker 对 `session cwd + relative path` 做 real-path canonicalization、符号
   "description": "上报 checkpoint 完成。必须提供 Evidence Artifact ID，编排层会独立验证，不接受文字断言。",
   "inputSchema": {
     "type": "object",
-    "required": ["checkpointId", "artifactId"],
+    "required": ["commandId", "checkpointId", "artifactId"],
     "properties": {
+      "commandId": {
+        "type": "string",
+        "format": "uuid",
+        "description": "稳定幂等键；重复提交返回原 checkpoint execution"
+      },
       "checkpointId": {
         "type": "string",
         "description": "Task.checkpoints 里定义的 checkpoint ID"
@@ -273,9 +289,11 @@ Worker 对 `session cwd + relative path` 做 real-path canonicalization、符号
 
 ---
 
-## .mcp.json 注入格式
+## Session 专属 MCP 配置注入格式
 
-每个 session 启动时，session overlay 目录里写入：
+M2 每个 Session 启动时，在 session overlay 目录写入 `hearth-mcp.json`，并用
+`--strict-mcp-config --mcp-config {overlay}/hearth-mcp.json` 启动 Claude Code。禁止写项目根 `.mcp.json`，
+避免污染用户仓库、并发 Session 互相覆盖或凭证被 git 收集。
 
 ```json
 {

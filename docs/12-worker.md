@@ -34,22 +34,24 @@ M1 只有本地实现，M2 加远程实现，核心代码不动。
 public interface WorkerClient {
 
     /**
-     * 在目标 Worker 上启动一个 agent session。
-     * 返回 handle，用于后续操作和事件订阅。
+     * 启动一个精确进程代次。相同 commandId 重试必须返回同一结果，不能重复 spawn。
      */
-    AgentHandle launch(LaunchSpec spec);
+    WorkerCommandResult launch(LaunchCommand command);
 
     /**
-     * 取消指定 session。必须一定生效：先 SIGTERM，8s 后 SIGKILL，
-     * 最迟 10s 确认进程死亡。
-     * 幂等：session 已终止时调用不报错。
+     * 向已经存活的 Session 进程发起一次 Invocation（首轮 prompt 或后续 continue）。
+     * 同一 Session 默认只允许一个非终态 Invocation。
      */
-    void cancel(String sessionId);
+    WorkerCommandResult invoke(InvokeCommand command);
 
     /**
-     * 检查 session 对应的进程是否还活着。
+     * 取消精确进程代次。只匹配 sessionId/processGeneration/launchId 时才发送信号；
+     * 已终止时幂等返回 COMMITTED，身份不匹配时返回 REJECTED_BEFORE_COMMIT。
      */
-    boolean isAlive(String sessionId);
+    WorkerCommandResult cancel(CancelCommand command);
+
+    /** 查询精确进程身份，不能只按 sessionId 或 PID 判断。 */
+    ProcessSnapshot inspect(ProcessIdentity identity);
 
     /**
      * 订阅 session 的事件流（归一化的 EventEnvelope ndjson）。
@@ -61,10 +63,7 @@ public interface WorkerClient {
      * 或 Spring MVC WebSocket。任何实现都不得引入 Reactor/WebFlux。
      */
     java.util.concurrent.Flow.Publisher<EventEnvelope> streamEvents(
-        String sessionId,
-        long processGeneration,
-        long afterEventSeq
-    );
+        ProcessIdentity identity, long afterEventSeq);
 
     /** Worker 的标识和能力信息。 */
     WorkerInfo info();
@@ -72,10 +71,58 @@ public interface WorkerClient {
 ```
 
 ```java
+public record ProcessIdentity(
+    UUID sessionId,
+    long processGeneration,
+    UUID launchId
+) {}
+
+public record LaunchCommand(
+    UUID commandId,
+    ProcessIdentity process,
+    LaunchSpec spec
+) {}
+
+public record InvokeCommand(
+    UUID commandId,
+    UUID invocationId,
+    int attempt,
+    ProcessIdentity process,
+    String content
+) {}
+
+public record CancelCommand(
+    UUID commandId,
+    ProcessIdentity process,
+    Long cancellationVersion // Task cancel 时必填；standalone Invocation cancel 可空
+) {}
+
+public record WorkerCommandResult(
+    UUID commandId,
+    CommitState commitState,
+    String resultCode,
+    ProcessSnapshot process
+) {}
+
+public enum CommitState {
+    COMMITTED,
+    COMMITTED_WITH_WARNING,
+    REJECTED_BEFORE_COMMIT,
+    UNKNOWN_COMMIT_STATE
+}
+```
+
+`launch`、`invoke`、`cancel` 都是**命令**而不是普通 RPC：调用前由中心持久化 claim，网络重试复用
+同一 `commandId`。Worker 本地也要持久化最近命令结果；收到重复命令时返回原结果。只有
+`REJECTED_BEFORE_COMMIT` 可以自动换新 command；`UNKNOWN_COMMIT_STATE` 必须先 reconcile，禁止猜测后重放。
+`AgentHandle` 可以作为 `LocalWorkerClient` 内部实现细节，但不得作为跨本机/远机的领域契约。
+
+```java
 public record WorkerInfo(
     String workerId,
     String version,
-    Set<String> capabilities,  // "claude-code", "codex", "gemini", "opencode"
+    Set<String> capabilities,  // "claude-code", "codex", "gemini", "opencode", "pi-rpc"
+    Map<String, ToolGovernanceLevel> adapterGovernance,
     String hostname,
     WorkerStatus status        // ONLINE, OFFLINE, DRAINING
 ) {}
@@ -83,6 +130,14 @@ public record WorkerInfo(
 
 **本地实现**：`LocalWorkerClient` 用 `ProcessBuilder` 直接启动进程。
 **远程实现**：`RemoteWorkerClient` 通过 WebSocket 发指令给远端 Worker 守护进程。
+
+每家 CLI 由独立 Adapter 实现 `launch/invoke/event normalization/tool governance/resume validation`。Pi Adapter
+使用 RPC JSONL 的 prompt/steer/follow_up 驱动 Invocation，但在受审 Extension 或 sandbox 启用前只上报
+`OBSERVE_ONLY`，不得借 Pi 内置工具绕过 Profile preflight。
+
+Adapter 同时声明 `ProcessReusePolicy`：`STREAMING_STDIN` 表示 result 后可继续向同代进程写下一条 Invocation；
+`RESUME_PER_INVOCATION` 表示每次 Invocation 使用新 process generation，并由 Adapter 生成/验证
+ResumeDescriptor。调用方只依赖策略，不得因一次 CLI 实测可复用就把所有 Adapter 写死为长驻。
 
 ---
 
@@ -98,9 +153,10 @@ public record WorkerInfo(
   3. 等待指令
 
 运行时：
-  收到 LAUNCH 指令 → 校验 providerRoute/workspaceRoot → 写 session overlay 文件 → 设环境变量 → spawn agent 进程
+  收到 LAUNCH 指令 → 校验 providerRoute/workspaceRoot/Profile 要求与 Adapter 工具治理能力
+                    → 写 session overlay 文件 → 用进程 API 设置 validated cwd 和环境变量 → spawn agent 进程
   收到 CANCEL 指令 → 仅当 processGeneration 等于本地当前代次才执行
-                    → SIGTERM → 8s → SIGKILL → 最迟 10s 回执
+                    → 控制通道可达时 SIGTERM → 8s → SIGKILL → 最迟 10s 回执
   每代进程事件使用从 1 单调递增的 eventSeq；未确认事件持久化到 Worker 本地受限目录
   每 30s 发心跳：{workerId, aliveProcesses: [{sessionId, processGeneration, lastEventSeq}]}
 
@@ -137,9 +193,13 @@ Worker 重连后立刻发：
     if 中心认为 CANCELLED/FAILED → 发精确 generation 的 CANCEL（补偿）
     if 中心不认识 sessionId/generation → 发 CANCEL（孤儿进程）
 
-Worker 事件统一携带 `{workerId, connectionId, sessionId, processGeneration, eventSeq, eventType, payload}`。
-中心先按 `(sessionId, processGeneration, eventSeq)` 幂等落水位，再把业务事件写为全局单调
-`domain_event.event_id`。语义完成、stream EOF、process exit、transport disconnect 使用不同 eventType。
+Worker 事件统一携带 `{workerId, connectionId, sessionId, processGeneration, launchId, eventSeq,
+invocationId, eventType, payload}`。`invocationId` 对进程级事件可空，对 Invocation/Exchange 相关事件必填。
+
+中心处理一条事件时必须在**同一数据库事务**中：锁定 `worker_event_receipt` → 检查下一序号 → 更新聚合
+状态 → 插入 `domain_event` → 推进 receipt 水位 → 提交。只有提交成功后才向 Worker ACK。禁止先推进水位再写
+业务事件，否则中心在两步之间崩溃会永久丢失已经确认的事件。语义完成、stream EOF、process exit、
+transport disconnect 使用不同 eventType。
 ```
 
 ---
@@ -150,15 +210,16 @@ agent 在 Worker 本地产出文件（代码 diff、测试报告），需要传�
 
 传输路径：
 ```
-agent 调用 hearth MCP tool: hearth_save_artifact(type, content/path)
-  → Worker 端 MCP server 接收
-  → Worker 通过 WebSocket 流式上传到中心
+agent 调用中心 Hearth MCP tool: hearth_save_artifact(type, content)
+  → 中心 hearth-platform-mcp 验证 session capability 与大小
   → 中心存入对象存储，返回 artifactId
   → MCP tool 把 artifactId 返回给 agent
 ```
 
-大文件（>1MB）用分块上传，小文件直接内嵌在 WebSocket 消息里。
-上传失败重试 3 次，超限则 Artifact 标记 `UPLOAD_FAILED`，对应 Checkpoint 无法通过。
+M2 首期的 MCP 只接受内容，不接受 Worker 文件 path。未来增加 path/大文件上传时，Worker 提供受限的
+`ArtifactUploadRelay`（它不是第二个 MCP Server）：对 Session cwd 内相对路径做 real-path 校验，再通过带
+chunk hash、总 sha256 和幂等 finalize 的协议流式上传中心。上传失败重试 3 次，超限则 Artifact 标记
+`UPLOAD_FAILED`，对应 Checkpoint 无法通过。
 
 ---
 
@@ -285,6 +346,13 @@ Path resolveAllowedCwd(Path configuredRoot, String relativeCwd) {
 **禁止**：把 API key、session token 等敏感内容拼进 argv。只走环境变量或权限受限的临时文件，
 并在进程退出后删除临时文件。环境变量仍属于同用户进程可读的敏感信息，不能视为 secret manager。
 
+`LocalWorkerClient` 不能直接继承 Hearth 中心进程的全部环境。构造 child environment 时先移除所有已知
+provider/IM/数据库/管理员凭证（至少 `ANTHROPIC_API_KEY`、数据库密码、Feishu/Telegram token），再按
+Adapter allowlist 复制必要的 PATH/locale/terminal 变量，并只注入 session capability token。M1 contract test
+必须让测试 CLI 打印**环境变量名列表和敏感值 hash 扫描结果**，证明真实上游 key 不在 child environment；
+测试输出本身也不得打印 secret。未 sandbox 的同用户进程仍可能读取宿主其他进程信息，因此这是最小隔离，
+不是多用户安全边界。
+
 ---
 
 ## 三类 Timeout 要分开追踪
@@ -297,7 +365,8 @@ agent 进程启动后有两个独立的超时：
 | `idleTimeout` | Invocation 运行中多久没有新事件 | 5min | Invocation → TIMED_OUT；按策略终止或保留 Session 进程 |
 | `totalTimeout` | 指定进程代次/Task 的整体运行上限 | 60min（可配） | 非终态 Invocation → TIMED_OUT，进程进入终止流程 |
 
-`firstEventTimeout` 超时 = invocation 根本没有启动成功，错误信息要去已脱敏 stderr 诊断 Artifact 里找。
+`firstEventTimeout` 超时 = invocation 根本没有启动成功。M1 把已脱敏 stderr 摘要写入受限诊断存储并记录
+`invocation.diagnostic_ref`；M2 可进一步把需要长期引用的诊断固化为 Artifact。
 `idleTimeout` 超时 = invocation 启动了但卡在某步，通常是工具调用没返回。
 收到 adapter 的语义完成事件后立即完成 Invocation；不得继续等待 stdout EOF。CLI 进程是否保留复用由
 Session 策略单独决定。取消/异常路径必须在 finally 中关闭 event publisher 并完成所有等待 future。
@@ -306,7 +375,8 @@ Session 策略单独决定。取消/异常路径必须在 finally 中关闭 even
 
 LAUNCH 前由中心和 Worker 分层验证：provider route 已启用、model 在白名单且与 wire protocol 兼容、
 credential reference 当前可解析、CLI/Adapter 版本兼容、Worker capability 匹配、cwd 在 allowed root 内、
-ResumeDescriptor 可由该 Adapter 解析。401/403、未知模型、无效 resume 和配置错误属于永久错误，不交给
+ResumeDescriptor 可由该 Adapter 解析，以及 Profile 要求的工具治理等级可满足。401/403、未知模型、无效 resume、
+无法执行权限策略和配置错误属于永久错误，不交给
 CLI 无限重试；stderr 只保存脱敏摘要，且 CLI 内部重试不能突破 Hearth total deadline。
 
 
@@ -319,7 +389,7 @@ M1 只在本机运行，但必须做这一件事：
 // M1 的实现，行为和直接用 ProcessBuilder 完全一样
 // 但 M2 只需要加 RemoteWorkerClient，不改任何调用方代码
 WorkerClient worker = new LocalWorkerClient();
-AgentHandle handle = worker.launch(spec);
+WorkerCommandResult result = worker.launch(command);
 ```
 
 这是 M1 最重要的一个"为未来预留"的设计决策，其他都可以推迟。

@@ -77,19 +77,22 @@ Testcontainers      2.0.5（Boot 4.0.7 BOM，集成测试用 PostgreSQL 容器�
 hearth/                    根 pom，dependencyManagement
   hearth-core/             领域模型、ValueObject、接口定义（无 Spring 依赖）
   hearth-gateway/          网关透传、观测、模型路由
+  hearth-agent/            Profile/版本/Session overlay 编译
   hearth-worker/           WorkerClient 接口 + 本机 LocalWorkerClient 实现
   hearth-orchestrator/     任务编排、A2A、预算账本、生命周期状态机
-  hearth-memory/           记忆分层、提炼管线（Spring AI 只在这里）
+  hearth-artifact/         Artifact 元数据、内容存储与引用保护
+  hearth-platform-mcp/     Hearth 平台工具的 MCP Server（M2；不含记忆实现）
+  hearth-memory/           记忆分层、提炼管线（Spring AI 的模型/VectorStore 只在这里）
   hearth-trigger/          触发层：飞书/Telegram/cron/webhook → Task
   hearth-api/              Web UI 后端、管理 REST API
 ```
 
-**M1 需要启动**：`hearth-core` + `hearth-gateway` + `hearth-worker`（本机实现）+
+**M1 需要启动**：`hearth-core` + `hearth-gateway` + `hearth-agent` + `hearth-worker`（本机实现）+
 `hearth-api`，并构建 `frontend/` 静态资源。M1 的 Web UI 和 REST/SSE 契约由 `hearth-api` 提供，
 因此不能把它推迟。
 
-M2 再创建 `hearth-orchestrator` 与 `hearth-trigger`，M3 创建 `hearth-memory` 并在
-`hearth-trigger` 启用 Quartz/ShedLock 自动化。根 pom 只声明当前里程碑实际存在的模块，避免
+M2 再创建 `hearth-orchestrator`、`hearth-artifact` 与 `hearth-platform-mcp`；M3 创建 `hearth-memory`、`hearth-trigger`，
+并在 `hearth-trigger` 启用 Quartz/ShedLock 自动化。根 pom 只声明当前里程碑实际存在的模块，避免
 未完成模块拖累构建，但 V001 数据库结构从第一天保持完整。
 
 ```xml
@@ -333,6 +336,8 @@ flyway-core                   数据库迁移
 ## Spring AI 2.0 MCP Server 注意事项
 
 Hearth 把自己的工具（hearth_dispatch_a2a 等）暴露给 agent 时，用的是 Spring AI 的 MCP Server。
+该依赖属于 M2 的 `hearth-platform-mcp`，不是 M3 的 `hearth-memory`。`hearth-memory` 到 M3 再通过
+application port 为同一 MCP server 增加 `hearth_retrieve_memory` 实现，MCP transport 不因此迁移。
 
 **正确 artifact（Spring AI 2.0）**：
 ```xml
@@ -342,7 +347,7 @@ Hearth 把自己的工具（hearth_dispatch_a2a 等）暴露给 agent 时，用�
 </dependency>
 ```
 
-**必须显式设置 Streamable HTTP 协议**（Spring AI 2.0 默认，SSE transport 已弃用）：
+**必须显式设置 Streamable HTTP 协议**（不要依赖默认值，SSE transport 已弃用）：
 ```properties
 spring.ai.mcp.server.protocol=STREAMABLE
 spring.ai.mcp.server.name=hearth
@@ -371,7 +376,7 @@ Spring AI 2.0 + Boot 4 使用 Jackson 3，部分 Jackson 2 的 API（`ObjectMapp
 
 **陷阱3：MCP transport 配置**
 
-Spring AI 2.0 的 MCP Server 默认用 Streamable HTTP，不是 SSE。参考官方文档配置，不要照搬 1.x 的配置。
+Spring AI 2.0 应显式配置 Streamable HTTP，不要依赖 transport 默认值，也不要照搬 1.x 的 SSE 配置。
 
 **陷阱4：Testcontainers 版本**
 

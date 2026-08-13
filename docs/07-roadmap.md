@@ -34,6 +34,18 @@
 
 **不做**：多 agent、记忆、调度、任何 UI 美化。Postgres 在 M1 就装好（和 M2 共用，不迁移）。
 
+**实施切片（顺序 gate，不并行铺模块）**：
+
+| Slice | 可独立验证的出口 |
+|---|---|
+| M1.0 接入 spike | Claude Code 经最小受控代理完成真实流式请求，认证头替换与 base URL 行为有 fixture/抓包证据；并实测 stream-json result 后能否接收第二条 stdin，确定 ProcessReusePolicy；spike 不直接演化成生产 Controller |
+| M1.1 数据面 | 有界请求读取、响应 streaming、Exchange 录制/partial、pricing snapshot 和协议 contract test 通过 |
+| M1.2 运行面 | bootstrap → Session → Process generation → 两次单活 Invocation → Worker event 重放完整闭环 |
+| M1.3 产品面 | 管理认证/CSRF、REST transcript、publication SSE/snapshot 收敛、最小 UI 和性能验收通过 |
+
+任何 slice 未通过其自动化出口，不提前实现下一里程碑功能。原“3–5 周”只是目标窗口，若安全、恢复或真实
+Claude Code contract 尚未通过，不以删验收项换日期。
+
 **M1 结束后你会知道**：
 - 网关附加延迟是否达到 p95 TTFB ≤ 50ms（以相同请求直连为基线）
 - 从现有直连或第三方中继迁移到 Hearth 有没有隐藏问题
@@ -43,21 +55,27 @@
 
 ## M1 可执行验收规格
 
-M1 不是“页面看起来能用”就完成。验收在全新 PostgreSQL 16 数据库上执行，并保存命令输出、
-HTTP 响应和 UI 截图为 Artifact。
+M1 不是“页面看起来能用”就完成。验收在全新 PostgreSQL 16 数据库上执行，并把命令输出、HTTP 响应和
+UI 截图保存为 CI/build Evidence artifact（带 URI+sha256 的验收 manifest）。Hearth 自身的 Artifact API 是
+M2 能力，M1 验收不能反过来依赖尚未实现的 M2 模块。
 
 ### Given：干净、可重复的环境
 
 - 给定全新数据库，Flyway 从 0 执行 V001，一次成功且 `validate` 通过。
-- 仅从环境变量加载 `HEARTH_DB_PASSWORD`、`ANTHROPIC_API_KEY`；缺失时启动明确失败。
+- 从环境变量加载 `HEARTH_DB_PASSWORD`、`ANTHROPIC_API_KEY`、`HEARTH_WORKSPACE_ROOT` 和
+  `HEARTH_ANTHROPIC_ALLOWED_MODELS`；缺失或路径/模型列表无效时启动明确失败。
 - 网关只监听配置的本机地址；测试日志和数据库检索确认没有 secret 或 capability token 明文。
-- 创建 standalone session 后获得一次性的 gateway capability token，数据库只存在 SHA-256 hash。
+- LocalWorkerClient child environment 已剥离真实 provider/数据库/IM/admin credential，只含 session capability；
+  验收用 hash/变量名检查，不把 secret 本身打印进 Evidence。
+- 创建 standalone session 时 application service 签发一次性的 gateway capability token，明文只进入
+  受保护的 `LaunchCommand` 环境，浏览器响应不含 token，数据库只存在 SHA-256 hash。
 
 ### When：运行真实 Claude Code 对话
 
 1. 通过 WorkerClient 启动 Claude Code，注入 session 路径与 gateway token。
 2. 在同一 Session 发出至少两次 Invocation，包含至少两轮 user 消息和一次 tool use/tool result。
-3. 模拟 adapter `semantic_completed` 后 stdout 仍打开，验证 Invocation 完成而 Session 进程可继续复用。
+3. 用 Adapter fixture 模拟 `semantic_completed` 后 stdout 仍打开，验证 Invocation 完成不依赖 EOF；真实 CLI
+   再按已验证的 ProcessReusePolicy 断言“同代进程回 READY”或“进程正常退出、逻辑 Session 可换代 resume”。
 4. 网关转发真实流式 Anthropic Messages 请求；测试代理或受控上游断言：
    - Hearth `Authorization` 未转发。
    - 静态 Anthropic key 仅出现在 `x-api-key`。
@@ -70,16 +88,17 @@ HTTP 响应和 UI 截图为 Artifact。
 ### Then：数据库与 API 断言
 
 - `session` 记录的 `task_id IS NULL`，provider route/workspace root/observability 字段完整；两次 Invocation 各有唯一终态。
-- Session 仍存活但无非终态 Invocation 时，API/UI 不显示为“正在回复”。
+- 逻辑 Session 仍可用但无非终态 Invocation 时，API/UI 不显示为“正在回复”；是否有长驻进程不改变该判断。
 - 每次上游调用恰有一个 exchange 且归属于 Invocation；响应结束后 token、延迟、状态和 `updated_at` 已更新。
 - `/api/v1/sessions/{id}` 返回最新完整 system prompt 和实际 recording status。
 - `/transcript` 顺序包含两轮 user/assistant/tool 内容且无 history 重复；重复文本发生在不同 turn 时仍保留。
 - `/exchanges` token 汇总与 Anthropic usage 一致；录制失败的 exchange 带 gap reason。
-- `/raw-request` 只能经用户管理权限下载，已脱敏；agent token 调用返回 403。
-- `domain_event.event_id` 严格递增；带 `Last-Event-ID` 重连 SSE 只补发之后事件。
+- `/raw-request` 默认关闭；测试显式开启后仅管理员可下载，已知 credential 被移除且响应标记可能含敏感会话
+  内容；agent token 调用返回 403，解析/已知 secret 无法安全处理时返回 409。
+- `domain_event.event_id` 只作内部标识；提交后 `event_publication.publication_seq` 严格递增，带 `Last-Event-ID` 重连 SSE 只补发之后的 publication。
 - Worker 重连按 eventSeq 去重重放；旧 process generation 的迟到事件不改变新代状态。
 - Session API 无法提交任意 upstream URL、绝对 cwd 或 executable；目录逃逸与非白名单模型被拒绝。
-- M1 管理 API 要求本地管理员会话与 CSRF，gateway/MCP token 不能越权调用。
+- M1 管理 API 要求本地管理员会话与 CSRF，gateway token 不能越权调用；MCP 尚未启用也不签发 token。
 
 ### Then：UI 与性能断言
 
@@ -99,7 +118,7 @@ HTTP 响应和 UI 截图为 Artifact。
 - E2E：浏览器启动 standalone session、完成对话、查看 prompt/transcript/gap；关键流程必须录屏或截图。
 - 覆盖率：项目规则要求总体 ≥80%；安全与凭证重写分支必须全部覆盖。
 
-所有 Then 断言均须有独立 Artifact；缺任一 Evidence，M1 不算完成。
+所有 Then 断言均须在验收 manifest 中有独立 Evidence URI+sha256；缺任一 Evidence，M1 不算完成。
 
 ---
 
@@ -178,7 +197,7 @@ pgvector 与 `memory_card` 由 M3 的 V002 引入。
 
 | 功能 | 为什么推迟 |
 |---|---|
-| Codex / Gemini / opencode 接入 | M1 只需要 Claude Code 验证核心假设；其他 CLI 按适配器接口添加即可 |
+| Codex / Gemini / opencode / Pi Agent 接入 | M1 只需要 Claude Code 验证核心假设；Pi Agent 通过 RPC 模式接入（见 `docs/15-pi-agent-adr.md`），其他 CLI 按适配器接口添加即可 |
 | Skill 市场 | 记忆系统先跑起来，看哪些行为值得固化成 skill。**到时候必须有 sandbox 规格（seccomp + cgroups + overlayfs）**，OpenClaw 2026 年的供应链攻击教训：sandbox 是强制项，不是可选项 |
 | Skill 提案捕获 | M3 记忆系统稳定后加。机制：任务完成后检测「可重复 step sequence」，生成候选 Skill 进 Inbox 让用户确认，不自动创建 |
 | Agent Council 模式 | M2 A2A 基础设施完成后加，fan-in 合并逻辑不复杂 |
@@ -191,6 +210,8 @@ pgvector 与 `memory_card` 由 M3 的 V002 引入。
 ## 现在最该做的一件事
 
 验证迁移路径：把现有 Claude Code 直连或第三方中继链路，改成 Claude Code → Hearth 网关 → Anthropic。
+
+M2+ 阶段额外验证：通过 Hearth 启动 Pi Agent（RPC 模式），确认其工具调用和 LLM 请求均经过 Hearth 网关观测与权限控制（见 `docs/15-pi-agent-adr.md`）。
 
 ```bash
 # 找到 cc-switch 写的 base_url 在哪

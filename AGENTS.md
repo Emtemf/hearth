@@ -21,7 +21,7 @@ BDD: Given 本地启动 Hearth 网关，
 
 ### M2 验收（再 4-6 周）
 ```
-BDD: Given 两台机器各运行 Hearth Worker（或单机两个 Worker 模拟），
+BDD: Given 两台机器各运行 Hearth Worker（或单机两个 Worker 模拟），且验收取消时目标 Worker ONLINE、控制通道可达，
      When  通过 Web UI 分配一个真实编码任务，
      Then  architect 和 coder 两个 agent 自动协作完成，
            Web UI 调用图能看到 A2A 消息、每个 agent 的 system prompt、预算消耗，
@@ -146,7 +146,7 @@ Context     已知信息 + 来源标注（file/memory/artifact/human_stated）+ 
 Choice      选择理由（必须引用 Context 来源，禁止"我认为"+ 空气）
 Checkpoint  中间验证点，编排层独立验证（不接受 agent 自报结论，只接受 Artifact ID）
 Correction  偏差处置策略（retry / escalate_to_human / try_alternative）
-Evidence    每个断言附带可独立核验的 Artifact ID（无 Artifact = 断言不成立）
+Evidence    每个执行结果/Checkpoint/Goal 完成或受阻断言附带可独立核验的 Artifact ID；Context 的 file/memory/human_stated 只算 SourceRef，作为完成证据时必须固化为 Artifact
 ```
 
 `escalate` 消息必须附带 `evidenceArtifactIds`，空数组不处理。
@@ -189,7 +189,7 @@ Exchange    Invocation 内一次上游模型调用
 429 读 `Retry-After` 头，按指定时间等。超限 → 死信 → Inbox `task_failed`。
 
 ### 幂等
-A2A 消息：`messageId` upsert。触发层：`triggerKey = hash(来源+内容+分钟窗)`去重。
+A2A 创建：调用 Session 的稳定 `commandId`；投递端用 `messageId` upsert。触发层：`triggerKey = hash(来源+内容+分钟窗)`去重。
 预算扣除：`SELECT FOR UPDATE`，不用乐观锁。
 
 ### 任务 persistence
@@ -201,7 +201,7 @@ A2A 消息：`messageId` upsert。触发层：`triggerKey = hash(来源+内容+�
 - Task 用 `parent_task_id` 持久化子任务树；G4C+E 的 Goal/Context/Choice/Checkpoint/Correction/Evidence policy 均有字段
 - `session.task_id` / `artifact.task_id` 永久可空，支持 standalone session；M2 编排流在应用层要求非空
 - 所有运行事件携带 `(sessionId, processGeneration, eventSeq)`；Worker 断线重连按最后确认序号重放
-- `domain_event.event_id` 是 UI/SSE 的唯一可见顺序；cursor 过期时必须拉 REST snapshot + watermark 后再续传
+- `domain_event.event_id` 只是内部 ID，不等于提交顺序；单 publisher 在提交后分配 `event_publication.publication_seq`，它才是 UI/SSE 唯一可见顺序；cursor 过期时必须拉 REST snapshot + watermark 后再续传
 - `observability_level` 表示接入机制，`recording_status` 表示实际完整度；full 也可能 partial
 - Anthropic 重复发送完整 history；Transcript 按最长公共前缀和规范化 turn identity 去重，禁止按文本全局去重
 - Artifact 被引用时不得删除；零引用删除保留 sha256 tombstone
@@ -218,17 +218,19 @@ A2A 消息：`messageId` upsert。触发层：`triggerKey = hash(来源+内容+�
 - Schedule 只创建根 Task，自动化 Task 及其后代继承 `mayManageSchedules=false`
 - 默认 overlap/misfire 为 SKIP，不补无限 backlog，不允许递归 cron
 
-### 强制取消（必须一定生效）
+### 强制取消（命令必须持久化并最终生效）
 取消信号走独立持久化 outbox 和独立线程，不受任务繁忙影响。
 Task `cancellation_version` 与 Session `fencing_generation` 分离；Worker 只执行 generation 精确匹配的命令。
-SIGTERM → 等待 8s → SIGKILL，最迟 10s 确认进程死亡。级联向下取消所有子任务防孤儿进程。
+Worker ONLINE 且控制通道可达时，SIGTERM → 等待 8s → SIGKILL，最迟 10s 确认进程死亡。网络分区时
+中心立即持久化取消并撤销 session capability，Task 保持 CANCELLING；Worker 重连后优先执行，不能伪报
+10s 内已死亡。级联向下取消所有子任务防孤儿进程。
 
 ### 部分失败
 默认策略：保留已成功、只重试失败、超限进 Inbox 附带全部证据，人来决定。
 
 ### 分布式追踪
 所有链路传播 `traceId`：MDC 注入日志、HTTP 请求头 `X-Trace-Id`、A2A 消息 TraceContext。
-事件顺序用 Postgres sequence，不用时间戳排序（多机时钟漂移）。
+事件顺序用提交后由单 publisher 分配的 `event_publication.publication_seq`，不用时间戳排序（多机时钟漂移）。
 
 详见 `docs/11-resilience.md`。
 
@@ -243,7 +245,8 @@ Worker 职责：注册 → 心跳 → 接收 launch/cancel 指令 → 上报状�
 心跳与事件携带 `processGeneration`；控制面事件有每进程单调 `eventSeq`，Worker 持久化未确认事件并在重连后重放。
 Worker 认证：每个 session 分别签发 gateway/MCP opaque 256-bit capability token，数据库只存 SHA-256；
 token 绑定 `(workerId, sessionId, audience, expiresAt)`，终止时撤销。
-Artifact 传输：agent 通过 MCP tool 上传，Worker 转发到中心对象存储，返回 artifactId。
+Artifact 传输：M2 首期由 agent 通过中心 Platform MCP 按 content 上传并返回 artifactId；未来 path/大文件上传才由
+Worker 在 session cwd 边界内读取并中继，中心不接受任意 path。
 
 M1 用本机 Worker，M2 扩展到多机，M3 用 Tailscale 跨地点。
 
@@ -257,7 +260,7 @@ M1 用本机 Worker，M2 扩展到多机，M3 用 Tailscale 跨地点。
 
 | 等级 | 能拿到 | 计费 |
 |---|---|---|
-| `full` | system prompt 全文、tools schema、全量 messages、精确 token/成本 | API |
+| `full` | system prompt 全文、tools schema、全量 messages、精确 token；有版本化 pricing 时计算成本 | API |
 | `sidecar` | 对话内容、工具调用、准确 token/成本（转录文件实测） | 订阅 |
 | `none` | 仅生命周期事件（开始/结束/退出码） | 订阅 |
 
@@ -308,3 +311,4 @@ M1 用本机 Worker，M2 扩展到多机，M3 用 Tailscale 跨地点。
 | `docs/12-worker.md` | Worker 守护进程，蜂窝架构，WorkerClient 接口 |
 | `docs/13-ui.md` | 桌面端信息架构、前端规范与交互状态 |
 | `docs/14-automation.md` | AI 资讯、学习工作流、Schedule 隔离与通知策略 |
+| `docs/15-pi-agent-adr.md` | Pi Agent 集成决策：可选 Adapter，不作基础运行时 |

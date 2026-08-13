@@ -1,6 +1,6 @@
 # Hearth
 
-Hearth 是一个面向 AI 编码 Agent 的自托管编排与可观测平台。它计划统一协调 Claude Code、Codex、Gemini CLI、opencode 等工具，让会话路由、证据、预算、生命周期和记忆始终处于使用者控制之下。
+Hearth 是一个面向 AI 编码 Agent 的自托管编排与可观测平台。它计划统一协调 Claude Code、Codex、Gemini CLI、opencode、Pi Agent 等工具，让会话路由、证据、预算、生命周期和记忆始终处于使用者控制之下。
 
 > **当前状态：架构与规格设计阶段。** 仓库目前包含设计文档和工程约束，Hearth 运行时与 Web UI 尚未实现，暂时没有可执行的安装或快速开始流程。
 
@@ -14,6 +14,7 @@ Hearth 是一个面向 AI 编码 Agent 的自托管编排与可观测平台。�
 - 通过 Issue 提出设计矛盾、遗漏的失败场景、安全风险或可验证的替代方案。
 
 `docker-compose.yml` 和 `.env.example` 目前只描述规划中的本地依赖与配置边界，不代表 Hearth 应用已经可以启动。
+默认 Compose 只启动 M1 的 PostgreSQL；`--profile m2` 增加 Redis，`--profile m3` 增加 Ollama。
 
 ## 适合谁
 
@@ -46,7 +47,7 @@ Worker 上的 Agent CLI ──> Hearth 透明网关 ──> wire-compatible Prov
 
 ## 项目目标
 
-- 通过字节级透明的模型网关观测完整 Agent 会话。
+- 通过响应流字节保真、请求未知字段保留的透明模型网关观测完整 Agent 会话。
 - 为每个 Session 路由到显式配置且 wire protocol 兼容的模型端点。
 - 编排具有不同职责的 Agent，并提供预算约束、防套娃和人工升级机制。
 - 使用 G4C+E，要求重要完成声明必须附带可独立核验的 Artifact 证据。
@@ -110,6 +111,7 @@ docker-compose.yml 规划中的 PostgreSQL、pgvector 与 Ollama 本地依赖
 - [Worker 蜂窝架构](docs/12-worker.md)
 - [Web UI 设计](docs/13-ui.md)
 - [自动化设计](docs/14-automation.md)
+- [Pi Agent 集成决策](docs/15-pi-agent-adr.md)
 
 ## 当前阶段如何参与
 
