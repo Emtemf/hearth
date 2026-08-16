@@ -43,21 +43,21 @@ Worker 上的 Agent CLI ──> Hearth 透明网关 ──> wire-compatible Prov
 - **控制面**负责 Task、Session、Invocation、预算、取消、重试和人工决策门。
 - **数据面**负责模型请求的字节级透传、system prompt 观测、路由和 token/成本记录。
 - **Worker**只负责启动本机 Agent 进程并上报状态；所有调用方只能依赖 `WorkerClient`。
-- **Artifact**是 G4C+E 中 Evidence 的物质载体；没有可独立核验的 Artifact，完成声明不成立。
+- **Artifact**只存材料；`EvidenceClaim + VerificationRecord` 才说明材料证明了什么、由谁以何种方法验证。
 
 ## 项目目标
 
 - 通过响应流字节保真、请求未知字段保留的透明模型网关观测完整 Agent 会话。
 - 为每个 Session 路由到显式配置且 wire protocol 兼容的模型端点。
 - 编排具有不同职责的 Agent，并提供预算约束、防套娃和人工升级机制。
-- 使用 G4C+E，要求重要完成声明必须附带可独立核验的 Artifact 证据。
+- 使用阶段化 G4C+E，把原始需求、不可变规格、不可变计划、执行 Claim 和验证记录分开。
 - 在多台已认证的 Worker 机器上运行 Agent，同时避免向 Agent 暴露上游凭证。
 - 提供持久记忆、定时任务和通讯集成，但不允许 Agent 创建失控的自动化。
 
 ## 里程碑
 
 - **M1——可观测 Session：** 通过 Hearth 启动 Claude Code，并在 Web UI 查看 system prompt、完整对话、token 用量和录制缺口。
-- **M2——多 Agent 执行：** 把真实编码任务分配给协作 Agent，并查看 A2A 消息、证据、预算消耗和取消生命周期。
+- **M2——多 Agent 执行：** 把真实编码任务分配给协作 Agent，并查看 Internal Dispatch、Claim/Verification、预算消耗和取消生命周期。
 - **M3——助理自动化：** 通过通讯软件触发任务和提醒，引入持久调度、记忆检索与人工决策门。
 
 每个里程碑以验收证据为完成条件，而不是以功能清单或 Agent 自报结论为准。完整规格见[路线图](docs/07-roadmap.md)。
@@ -71,6 +71,7 @@ Worker 上的 Agent CLI ──> Hearth 透明网关 ──> wire-compatible Prov
 - Agent 进程只能通过 `WorkerClient` 抽象启动。
 - Provider 凭证只能来自环境变量或 Secret Manager，禁止写入源码或进程参数。
 - M1 只支持 wire protocol 兼容的上游路由；跨协议转换必须由显式 Adapter 实现。
+- Pi Agent 只作为 M2 基础设施完成后的可选 RPC Adapter，不 fork，也不嵌入 Hearth Java 核心。
 
 完整的项目宪法与技术约束见 [AGENTS.md](AGENTS.md)。
 
@@ -99,7 +100,7 @@ docker-compose.yml 规划中的 PostgreSQL、pgvector 与 Ollama 本地依赖
 - [数据库 Schema](docs/03-schema.md)
 - [Hearth MCP 工具](docs/04-platform-mcp.md)
 - [REST API 契约](docs/05-rest-api.md)
-- [A2A 与防套娃](docs/05-a2a-and-loops.md)
+- [Internal Dispatch、A2A Adapter 与防套娃](docs/05-a2a-and-loops.md)
 
 ### 生命周期与产品设计
 

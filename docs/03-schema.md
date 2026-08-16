@@ -5,18 +5,21 @@ Flyway 管理，文件放 `hearth-core/src/main/resources/db/migration/`。
 
 ---
 
-## ER 概览
+## ER 概览（按里程碑演进）
 
 ```
 workspace ──< workspace_root
           ──< provider_route ──< provider_pricing
-          ──< task ──< session ──< session_process
-                             ├────< invocation ──< exchange
-                             └────< worker_event_receipt
-                  ──< a2a_message
-                  ──< budget_node ──< budget_node（自引用树）
-                  ──< checkpoint_execution
-                  ──< task_goal_verification
+          ──< session ──< session_process
+                     ├────< invocation ──< exchange
+                     └────< worker_event_receipt
+
+task_request ──< task_spec_version ──< plan_version
+             └─< task（TaskExecution，自引用业务树）──< session
+                       ├──< budget_node（自引用划拨树）
+                       └──< dispatch_message
+
+evidence_claim ──< verification_record ──< verification_artifact >── artifact
 
 session ──< invocation ──< exchange
         ──< worker_command
@@ -33,15 +36,23 @@ domain_event ── event_publication（提交后 SSE 可见顺序）
 
 ---
 
-## V001__core_schema.sql — 完整核心结构
+## Migration 原则
 
-V001 一次创建 M1/M2 共用的完整关系结构。M1 只使用 `workspace`、管理认证、`workspace_root`、
-`provider_route`/pricing、Profile、Worker、`session`、`invocation`、`worker_command`、
-`worker_event_receipt`、`session_credential`、`exchange`、`domain_event` 和 `event_publication`；Task/A2A 表虽然存在，
-但直到 M2 才有业务流量。**里程碑通过功能开关和应用入口控制，不通过缺表控制。**
+Migration 按已验收的 vertical slice 演进，不在 V001 预建尚未验证的 M2 世界。Flyway migration 是不可修改的
+历史：某个版本进入共享环境后只新增后续 migration，禁止回写旧文件。里程碑仍由应用入口控制，但未来表
+不需要为了“外键一次闭环”提前存在；引用和目标在引入该能力的同一个 migration 中创建即可。
 
-这样所有外键在一次 migration 内均有合法目标，空库执行 V001 不依赖未来 migration。
-创建顺序以 SQL 文件中的外键依赖为准；循环引用在双方表创建后用 `ALTER TABLE` 补上。
+```text
+V001  M1 data-plane + standalone Session
+V002  M1 Worker lifecycle / command / replay / credential
+V003  M2 TaskRequest + TaskSpecVersion + PlanVersion + TaskExecution + PolicyBundleVersion
+V004  M2 internal dispatch + consumable budget
+V005  M2 Artifact + EvidenceClaim + VerificationRecord + Inbox/operation log/cancellation
+V006  M3 automation trigger extensions + memory/pgvector（可按实现 slice 继续细分）
+```
+
+下面的 SQL 是目标结构草案；真正实现时按上述 migration 拆分，并为每个 migration 单独做空库 migrate、
+upgrade、validate 和非法约束写入测试。
 
 ### workspace
 
@@ -137,7 +148,7 @@ Session 创建 API 只接受这两张表的 ID 和相对路径。服务端解析
 
 ---
 
-### agent_profile / agent_profile_version
+### policy_bundle_version / agent_profile / agent_profile_version
 
 ```sql
 CREATE TABLE agent_profile (
@@ -151,20 +162,36 @@ CREATE TABLE agent_profile (
     UNIQUE (id, workspace_id)
 );
 
+CREATE TABLE policy_bundle_version (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id    UUID NOT NULL REFERENCES workspace(id),
+    bundle_key      TEXT NOT NULL,                 -- coding-safe / research / assistant
+    version         INTEGER NOT NULL,
+    policies        JSONB NOT NULL,                -- normalized capability policy，非 adapter tool 名
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (workspace_id, bundle_key, version),
+    UNIQUE (id, workspace_id)
+);
+
 CREATE TABLE agent_profile_version (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    profile_id      UUID NOT NULL REFERENCES agent_profile(id),
+    workspace_id    UUID NOT NULL REFERENCES workspace(id),
+    profile_id      UUID NOT NULL,
     version         INTEGER NOT NULL,
     system_prompt   TEXT NOT NULL,
-    tool_whitelist  JSONB NOT NULL DEFAULT '[]',   -- ["read_file","write_file",...]
+    capabilities    JSONB NOT NULL DEFAULT '[]',   -- ["filesystem.read","codegraph.query",...]
     constraints     JSONB NOT NULL DEFAULT '[]',   -- [{rule, disposition}]
+    policy_bundle_version_id UUID REFERENCES policy_bundle_version(id),
     adapter_type    TEXT NOT NULL,                  -- claude-code/codex/gemini/opencode/pi-rpc
     required_governance TEXT NOT NULL DEFAULT 'OBSERVE_ONLY',
     preferred_model TEXT NOT NULL,
     memory_scope    JSONB NOT NULL DEFAULT '{}',   -- {workspace, agentRoles, tags}
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (profile_id, version),
-    UNIQUE (id, profile_id)
+    UNIQUE (id, profile_id),
+    FOREIGN KEY (profile_id, workspace_id) REFERENCES agent_profile(id, workspace_id),
+    FOREIGN KEY (policy_bundle_version_id, workspace_id)
+        REFERENCES policy_bundle_version(id, workspace_id)
 );
 
 ALTER TABLE agent_profile ADD CONSTRAINT fk_agent_profile_current_version
@@ -173,28 +200,79 @@ ALTER TABLE agent_profile ADD CONSTRAINT fk_agent_profile_current_version
 
 ---
 
-### task
+Adapter 在启动时把 normalized capability 映射到具体 CLI/MCP 工具名；Policy 可表达「代码探索必须先用
+`codegraph.query`」「第三方 API 事实必须由 `context7.docs` 或 `official_docs.search` 验证」。核心领域和
+Profile 不保存 Claude/Codex 专属 tool name。
+
+### task_request / task_spec_version / plan_version / task（M2）
 
 ```sql
-CREATE TABLE task (
+CREATE TABLE task_request (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     workspace_id    UUID NOT NULL REFERENCES workspace(id),
-    parent_task_id  UUID REFERENCES task(id),
     title           TEXT NOT NULL,
     brief           TEXT NOT NULL,
-    -- G4C+E
-    goal            TEXT NOT NULL,              -- 可验证的成功标准
-    context         JSONB NOT NULL DEFAULT '{"known":[],"gaps":[]}',
-    choice          JSONB NOT NULL DEFAULT '{"decision":null,"contextSources":[]}',
-    checkpoints     JSONB NOT NULL DEFAULT '[]',
-    correction      JSONB NOT NULL DEFAULT '{"onCheckpointFail":"escalate_to_human","onGoalBlocked":"escalate_to_human"}',
-    evidence_policy JSONB NOT NULL DEFAULT '{"required":true,"acceptedTypes":[]}',
-    -- 触发
+    source_kind     TEXT NOT NULL,              -- manual/cron/webhook/inbound_message/dispatch_request
+    source_ref      TEXT NOT NULL,              -- audit event / external source reference
+    external_event_id TEXT,                     -- source 提供的稳定 ID；优先用于幂等
+    fallback_dedupe_key TEXT,                   -- source 无 ID 时的短期 fallback，不使用分钟窗语义
+    status          TEXT NOT NULL DEFAULT 'INTAKE', -- INTAKE/CLARIFYING/SPECIFIED/REJECTED/CANCELLED
+    version         BIGINT NOT NULL DEFAULT 0,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (id, workspace_id)
+);
+
+CREATE UNIQUE INDEX uq_task_request_external_event
+    ON task_request(workspace_id, source_kind, external_event_id)
+    WHERE external_event_id IS NOT NULL;
+
+CREATE TABLE task_spec_version (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    request_id          UUID NOT NULL REFERENCES task_request(id),
+    version             INTEGER NOT NULL,
+    goal                TEXT NOT NULL,
+    context_items       JSONB NOT NULL DEFAULT '[]',
+    context_gaps        JSONB NOT NULL DEFAULT '[]',
+    acceptance_criteria JSONB NOT NULL DEFAULT '[]',
+    constraints         JSONB NOT NULL DEFAULT '[]',
+    evidence_policy     JSONB NOT NULL,
+    created_by_kind     TEXT NOT NULL,           -- HUMAN/SESSION/SYSTEM
+    created_by_ref      TEXT NOT NULL,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (request_id, version),
+    UNIQUE (id, request_id)
+);
+
+CREATE TABLE plan_version (
+    id                    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    spec_version_id       UUID NOT NULL REFERENCES task_spec_version(id),
+    version               INTEGER NOT NULL,
+    decision              JSONB NOT NULL,
+    alternatives          JSONB NOT NULL DEFAULT '[]',
+    trade_offs            JSONB NOT NULL DEFAULT '[]',
+    subtask_templates     JSONB NOT NULL DEFAULT '[]',
+    checkpoints           JSONB NOT NULL DEFAULT '[]',
+    correction_policy     JSONB NOT NULL,
+    created_by_session_id UUID,                  -- session FK 在双方表存在后添加
+    created_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (spec_version_id, version),
+    UNIQUE (id, spec_version_id)
+);
+
+CREATE TABLE task (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(), -- domain: TaskExecution
+    workspace_id    UUID NOT NULL REFERENCES workspace(id),
+    request_id      UUID NOT NULL REFERENCES task_request(id),
+    spec_version_id UUID NOT NULL REFERENCES task_spec_version(id),
+    plan_version_id UUID NOT NULL REFERENCES plan_version(id),
+    parent_task_id  UUID REFERENCES task(id),
+    -- 触发快照
     trigger_kind    TEXT NOT NULL,              -- manual / cron / webhook / inbound_message
-    trigger_key     TEXT,                       -- 自动/外部触发的稳定去重键；手动创建可空
     trigger_config  JSONB NOT NULL DEFAULT '{}',
     -- 生命周期
-    status          TEXT NOT NULL DEFAULT 'PENDING',
+    status          TEXT NOT NULL DEFAULT 'READY',
+                    -- READY/RUNNING/VERIFYING/AWAITING_HUMAN/CANCELLING/SUCCEEDED/FAILED/CANCELLED
     version         BIGINT NOT NULL DEFAULT 0,
     cancellation_version BIGINT NOT NULL DEFAULT 0, -- 每次用户取消原子 +1
     persistence     TEXT NOT NULL DEFAULT 'ephemeral',  -- ephemeral / durable
@@ -202,11 +280,15 @@ CREATE TABLE task (
     target_agent_role TEXT,
     trace_id        UUID NOT NULL DEFAULT gen_random_uuid(),
     -- 时间
+    deadline_at     TIMESTAMPTZ NOT NULL,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     ended_at        TIMESTAMPTZ,
     UNIQUE (id, workspace_id),
-    UNIQUE (workspace_id, trigger_key)
+    UNIQUE (id, spec_version_id),
+    FOREIGN KEY (request_id, workspace_id) REFERENCES task_request(id, workspace_id),
+    FOREIGN KEY (spec_version_id, request_id) REFERENCES task_spec_version(id, request_id),
+    FOREIGN KEY (plan_version_id, spec_version_id) REFERENCES plan_version(id, spec_version_id)
 );
 
 CREATE INDEX idx_task_workspace_status ON task(workspace_id, status);
@@ -215,6 +297,14 @@ CREATE INDEX idx_task_trace_id ON task(trace_id);
 ALTER TABLE task ADD CONSTRAINT fk_task_parent_same_workspace
     FOREIGN KEY (parent_task_id, workspace_id) REFERENCES task(id, workspace_id);
 ```
+
+`TaskRequest` 允许只有 brief；`TaskSpecVersion` 与 `PlanVersion` 发布后不可更新。用户改需求时创建新 spec，
+重新规划时创建新 plan。运行中的 Task 固定引用版本，禁止原地换目标。`request` dispatch 创建 Child
+TaskRequest/Task；`consult` 不创建 Task。
+
+入口幂等优先使用来源原生 `external_event_id`（飞书 event/message ID、Telegram update ID、webhook event ID、
+schedule fire ID）。来源确实没有 ID 时才计算带短 TTL 的 `fallback_dedupe_key`；命中只能标记 suspected
+duplicate 并走来源策略/人工确认，不能仅因同一分钟两条文字相同就静默丢弃。
 
 ---
 
@@ -227,15 +317,12 @@ CREATE TABLE budget_node (
     parent_id               UUID REFERENCES budget_node(id),   -- NULL = 根节点
     -- 预算
     granted_tokens          BIGINT NOT NULL DEFAULT 0,
-    granted_wall_ms         BIGINT NOT NULL DEFAULT 0,
     granted_usd             NUMERIC(12,6) NOT NULL DEFAULT 0,
     -- 消耗
     spent_tokens            BIGINT NOT NULL DEFAULT 0,
-    spent_wall_ms           BIGINT NOT NULL DEFAULT 0,
     spent_usd               NUMERIC(12,6) NOT NULL DEFAULT 0,
     -- 划拨给子节点的总量
     allocated_tokens        BIGINT NOT NULL DEFAULT 0,
-    allocated_wall_ms       BIGINT NOT NULL DEFAULT 0,
     allocated_usd           NUMERIC(12,6) NOT NULL DEFAULT 0,
 
     created_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -247,6 +334,10 @@ ALTER TABLE task
     ADD CONSTRAINT fk_task_root_budget_same_task
     FOREIGN KEY (root_budget_id, id) REFERENCES budget_node(id, task_id);
 ```
+
+token/USD 是可消耗、可划拨预算；扣除使用 `SELECT FOR UPDATE`。wall time 不进入 allocation ledger：Task 使用
+绝对 `deadline_at`（根 Task 根据运行时限计算，Child deadline 不得晚于父），Session/Invocation timeout 是
+执行策略。M2 初期聚合计数可作为锁内真相；稳定后增加 append-only `budget_ledger`，聚合字段降为 cache。
 
 ---
 
@@ -319,6 +410,7 @@ CREATE TABLE session (
     effective_model     TEXT NOT NULL,
     upstream_base_url   TEXT NOT NULL,
     wire_protocol       TEXT NOT NULL,    -- anthropic / openai-responses / gemini / ...
+    gateway_auth_carrier TEXT,            -- authorization_bearer / x_api_key / ...；非代理模式可空
     -- Worker
     worker_id           TEXT REFERENCES worker(id),
     -- 生命周期
@@ -358,6 +450,9 @@ CREATE INDEX idx_session_status ON session(status) WHERE status NOT IN ('TERMINA
 
 `task_id` 在 M1 standalone session 中允许为 `NULL`，M2 编排 session 必须由应用层保证非空；
 不在数据库层全局改成 `NOT NULL`，否则会破坏长期保留的手动 session 能力。
+`gateway_auth_carrier` 是服务端按 `adapter_type + wire_protocol` 从已通过 contract test 的 allowlist 生成的
+`GatewayIngressAuthBinding` 快照；Session API/Agent/Worker 不得自由提交。它只记录 carrier 类型，不记录 token；
+Gateway 必须从该 carrier 认证后剥离所有内部/客户端 credential，再注入服务端上游凭证。
 `resume_descriptor` 是 adapter 专属的带版本结构，禁止把未知裸字符串直接传给 CLI。恢复时重新解析
 `provider_route.credential_ref` 当前指向的 secret；不在 Session 中冻结或持久化 provider secret。
 Session 状态的唯一词表是 `PENDING/LAUNCHING/READY/ACTIVE/TERMINATING/TERMINATED/CRASHED`；业务完成、
@@ -580,7 +675,7 @@ CREATE TABLE artifact (
     command_id      UUID,                  -- MCP/工具创建时的稳定幂等键；系统内部导入可空
     type            TEXT NOT NULL,      -- code_change / document / test_result / ...
     status          TEXT NOT NULL DEFAULT 'PENDING_UPLOAD',
-                                    -- PENDING_UPLOAD/AVAILABLE/UPLOAD_FAILED/DELETED
+                                    -- PENDING_UPLOAD/AVAILABLE/UPLOAD_FAILED/DELETED/SECURITY_PURGED
     title           TEXT,
     content         TEXT,               -- 小文件直接存（< 64KB）
     storage_ref     TEXT,               -- 大文件存对象存储，路径在这里
@@ -601,16 +696,17 @@ CREATE INDEX idx_artifact_cleanup ON artifact(status, created_at);
 ```
 
 `PENDING_UPLOAD → AVAILABLE | UPLOAD_FAILED`；失败可重试并回到 `PENDING_UPLOAD`。
-清理只允许 `AVAILABLE → DELETED`，同时清空 `content/storage_ref`，保留同一行的
+普通清理只允许 `AVAILABLE → DELETED`，同时清空 `content/storage_ref`，保留同一行的
 `id/sha256/size_bytes/deleted_at/metadata` 作为 tombstone。删除前必须确认 `artifact_reference`
-计数为 0。
+计数为 0。安全/泄密事件允许管理员执行 `SECURITY_PURGE`，即使有引用也清除内容并保留最小 tombstone；
+同一事务把依赖该 Artifact 的 VerificationRecord 置为 `INVALIDATED` 并记录安全审计事件。普通 agent 无权调用。
 
 ### artifact_reference
 
 ```sql
 CREATE TABLE artifact_reference (
     artifact_id        UUID NOT NULL REFERENCES artifact(id),
-    referrer_type      TEXT NOT NULL, -- checkpoint/task_goal/a2a/inbox/operation_log/memory_card/domain_event
+    referrer_type      TEXT NOT NULL, -- verification_record/dispatch_message/inbox/operation_log/memory_card/domain_event
     referrer_id        TEXT NOT NULL,
     created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (artifact_id, referrer_type, referrer_id)
@@ -624,17 +720,19 @@ CREATE INDEX idx_artifact_reference_referrer
 
 ---
 
-### a2a_message
+### dispatch_message（Hearth 内部领域模型）
 
 ```sql
-CREATE TABLE a2a_message (
+CREATE TABLE dispatch_message (
     id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    command_id          UUID NOT NULL,
-    task_id             UUID REFERENCES task(id),    -- NULL in M1
+    command_id          UUID NOT NULL, -- 可信 MCP/Adapter 边界生成或确定性派生
+    source_task_id      UUID NOT NULL REFERENCES task(id),
+    child_task_id       UUID REFERENCES task(id), -- REQUEST 投递完成后必须有；其他 kind 必须为空
     from_session_id     UUID NOT NULL REFERENCES session(id),
-    to_agent_role       TEXT NOT NULL,
+    target_type         TEXT, -- SPAWN_PROFILE / EXISTING_SESSION；ESCALATE 无目标
+    target_profile_id   UUID REFERENCES agent_profile(id),
     to_session_id       UUID REFERENCES session(id), -- 初始可空，目标 Session 创建后回填
-    kind                TEXT NOT NULL,  -- request / consult / notify / escalate
+    kind                TEXT NOT NULL,  -- REQUEST / CONSULT / NOTIFY / ESCALATE
     content             TEXT NOT NULL,
     downgraded_from     TEXT,           -- 被降级前的原始 kind
     -- trace（签发后不可变快照，不只存在内存）
@@ -654,27 +752,27 @@ CREATE TABLE a2a_message (
     acknowledged_at     TIMESTAMPTZ,
     UNIQUE (from_session_id, command_id),
     UNIQUE (trace_id, span_id),
-    UNIQUE (id, task_id),
-    FOREIGN KEY (from_session_id, task_id) REFERENCES session(id, task_id),
-    FOREIGN KEY (to_session_id, task_id) REFERENCES session(id, task_id)
+    FOREIGN KEY (from_session_id, source_task_id) REFERENCES session(id, task_id)
 );
 
-CREATE INDEX idx_a2a_trace_id ON a2a_message(trace_id);
-CREATE INDEX idx_a2a_from_session ON a2a_message(from_session_id);
+CREATE INDEX idx_dispatch_trace_id ON dispatch_message(trace_id);
+CREATE INDEX idx_dispatch_from_session ON dispatch_message(from_session_id);
 
-CREATE TABLE a2a_message_artifact (
+CREATE TABLE dispatch_message_artifact (
     message_id      UUID NOT NULL,
     artifact_id     UUID NOT NULL,
-    task_id         UUID NOT NULL REFERENCES task(id),
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (message_id, artifact_id),
-    FOREIGN KEY (message_id, task_id) REFERENCES a2a_message(id, task_id) ON DELETE CASCADE,
-    FOREIGN KEY (artifact_id, task_id) REFERENCES artifact(id, task_id)
+    FOREIGN KEY (message_id) REFERENCES dispatch_message(id) ON DELETE CASCADE,
+    FOREIGN KEY (artifact_id) REFERENCES artifact(id)
 );
 ```
 
-API/MCP 中的 `artifactIds` 是 `a2a_message_artifact` 的投影，不在 JSONB 中保存无法约束的外键。创建关联时
-同事务写 `artifact_reference(referrer_type='a2a_message')`，消息删除/归档策略必须同步维护引用。
+Application service 强制：`REQUEST` 只能使用 `SPAWN_PROFILE`，创建 Child TaskRequest/Task 和新 Session 后回填
+`child_task_id`；`CONSULT/NOTIFY` 才能使用 `EXISTING_SESSION`，`ESCALATE` 作用于当前 Task；后三者的
+`child_task_id` 必须为空。目标字段满足与 kind 对应的互斥约束。外部 A2A wire message 只存在于 adapter，
+不得直接持久化为 core domain type。API/MCP 中的 `artifactIds` 是关联表投影；同事务写
+`artifact_reference(referrer_type='dispatch_message')`。
 
 ---
 
@@ -828,7 +926,7 @@ Worker 仅在命令的 `process_generation` 和 `launch_id` **都等于**本地�
 ```sql
 CREATE TABLE domain_event (
     event_id        BIGSERIAL PRIMARY KEY,           -- 数据库内部 ID；不承诺等于事务提交顺序
-    aggregate_type  TEXT NOT NULL,                   -- session / task / a2a_message / ...
+    aggregate_type  TEXT NOT NULL,                   -- session / task / dispatch_message / ...
     aggregate_id    UUID NOT NULL,
     trace_id        UUID,
     event_type      TEXT NOT NULL,                   -- 对应 EventType 枚举
@@ -860,54 +958,67 @@ M1 使用单一 `EventPublicationService`：它持有 Postgres advisory lock，�
 
 ---
 
-### checkpoint_execution（Checkpoint 验证结果，M2 任务编排依赖）
+### evidence_claim / verification_record（Artifact 不等于 Evidence）
 
 ```sql
-CREATE TABLE checkpoint_execution (
-    id                      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    task_id                 UUID NOT NULL REFERENCES task(id),
-    checkpoint_id           TEXT NOT NULL,           -- 对应 Task.checkpoints[].id
-    submitted_by_session_id UUID NOT NULL REFERENCES session(id),
-    command_id              UUID NOT NULL,
-    status                  TEXT NOT NULL DEFAULT 'PENDING',  -- PENDING/VERIFYING/PASSED/FAILED
-    evidence_artifact_id    UUID REFERENCES artifact(id),     -- agent 提交的 Evidence
-    attempt                 INTEGER NOT NULL DEFAULT 1,
-    verification_result     JSONB,                   -- 编排层独立验证的输出
-    notes                   TEXT,
-    created_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (task_id, checkpoint_id, attempt),
-    UNIQUE (submitted_by_session_id, command_id),
-    FOREIGN KEY (submitted_by_session_id, task_id) REFERENCES session(id, task_id),
-    FOREIGN KEY (evidence_artifact_id, task_id) REFERENCES artifact(id, task_id)
+CREATE TABLE evidence_claim (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    task_id             UUID NOT NULL REFERENCES task(id),
+    spec_version_id     UUID NOT NULL REFERENCES task_spec_version(id),
+    subject_type        TEXT NOT NULL, -- CHECKPOINT/GOAL/ARTIFACT/OPERATION
+    subject_ref         TEXT NOT NULL,
+    claim_type          TEXT NOT NULL,
+    statement           TEXT NOT NULL,
+    source_state_ref    JSONB NOT NULL, -- git/tree/diff SHA, workspace root, tool version/command
+    submitted_by_session_id UUID REFERENCES session(id),
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (id, task_id),
+    FOREIGN KEY (task_id, spec_version_id) REFERENCES task(id, spec_version_id),
+    FOREIGN KEY (submitted_by_session_id, task_id) REFERENCES session(id, task_id)
 );
 
-CREATE TABLE task_goal_verification (
-    id                      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    task_id                 UUID NOT NULL REFERENCES task(id),
-    status                  TEXT NOT NULL DEFAULT 'VERIFYING', -- VERIFYING/PASSED/FAILED
-    evidence_artifact_id    UUID NOT NULL,
-    verifier                TEXT NOT NULL, -- deterministic rule / trusted verifier profile + version
-    verification_result     JSONB NOT NULL,
-    attempt                 INTEGER NOT NULL DEFAULT 1,
-    created_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (task_id, attempt),
-    FOREIGN KEY (evidence_artifact_id, task_id) REFERENCES artifact(id, task_id)
+CREATE TABLE verification_record (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    claim_id            UUID NOT NULL,
+    task_id             UUID NOT NULL REFERENCES task(id),
+    attempt             INTEGER NOT NULL,
+    verifier_kind       TEXT NOT NULL, -- DETERMINISTIC_TOOL/REVIEWER_AGENT/HUMAN/COMPOSITE
+    verifier_ref        TEXT NOT NULL, -- rule id / profileVersion+session / human audit id / composition rule
+    method              JSONB NOT NULL,
+    source_state_ref    JSONB NOT NULL,
+    status              TEXT NOT NULL, -- PENDING/PASSED/FAILED/STALE/INVALIDATED
+    result              JSONB NOT NULL DEFAULT '{}',
+    verified_at         TIMESTAMPTZ,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (claim_id, attempt),
+    UNIQUE (id, task_id),
+    FOREIGN KEY (claim_id, task_id) REFERENCES evidence_claim(id, task_id)
+);
+
+CREATE TABLE verification_artifact (
+    verification_id UUID NOT NULL,
+    artifact_id     UUID NOT NULL,
+    task_id         UUID NOT NULL REFERENCES task(id),
+    purpose         TEXT NOT NULL, -- SUBJECT_OUTPUT/TOOL_OUTPUT/REVIEW_REPORT/SOURCE_SNAPSHOT
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (verification_id, artifact_id),
+    FOREIGN KEY (verification_id, task_id) REFERENCES verification_record(id, task_id) ON DELETE CASCADE,
+    FOREIGN KEY (artifact_id, task_id) REFERENCES artifact(id, task_id)
 );
 ```
 
-Task 只能在同一状态转换事务中确认存在 `PASSED` 的最新 `task_goal_verification` 后进入 `SUCCEEDED`。Goal
-验证引用与 `artifact_reference(referrer_type='task_goal_verification')` 同事务创建，不能只在 domain event
-payload 或 Task JSONB 里放一个裸 artifactId。
+Artifact 只是材料。Task 只能在同一状态转换事务中确认：当前 `spec_version_id` 的全部 Goal claim 都有最新、
+非 `STALE/INVALIDATED` 的 `PASSED` VerificationRecord，之后才能进入 `SUCCEEDED`。Reviewer 验证必须引用
+独立 reviewer Session 产出的 review Artifact；orchestrator 只执行 deterministic/composite rule，不直接调模型。
+`verification_artifact` 与 `artifact_reference(referrer_type='verification_record')` 同事务创建。
 
 ---
 
 ### 数据库约束不是应用层备注
 
-V001 必须为固定枚举状态和基础不变量添加 `CHECK` 约束，至少覆盖：Task/Session/Session Process/
-Invocation/A2A/Artifact/Inbox/Outbox 的 status、observability level、recording status、audience、persistence，
-以及非负 attempt/depth/token/cost。示例：
+每个 migration 必须同时为它引入的固定枚举和基础不变量添加 `CHECK` 约束。V001 覆盖 Session、Invocation、
+Exchange、observability/recording；V002 覆盖 Worker/Process/Command/Credential；V003+ 分别覆盖 Task、Dispatch、
+Artifact/Evidence/Inbox/Outbox，以及非负 attempt/depth/token/cost。示例：
 
 ```sql
 ALTER TABLE invocation ADD CONSTRAINT chk_invocation_status CHECK (status IN
@@ -924,13 +1035,13 @@ ALTER TABLE session_credential ADD CONSTRAINT chk_session_credential_audience
 ALTER TABLE task ADD CONSTRAINT chk_task_not_own_parent CHECK (parent_task_id IS NULL OR parent_task_id <> id);
 ```
 
-跨行/阶段不变量（如 `recording_status=complete` 时 gap reason 为空、Task SUCCEEDED 必须有通过的 Goal
-Evidence）由 application service 同事务验证；其中可表达为 CHECK 的部分仍下沉数据库。M1 验收必须实际
-查询约束存在并测试非法写入失败，不能只依赖 Java enum。
+跨行/阶段不变量（如 `recording_status=complete` 时 gap reason 为空、Task SUCCEEDED 必须有通过的当前
+Goal Verification）由 application service 同事务验证；其中可表达为 CHECK 的部分仍下沉数据库。每个 slice
+验收必须实际查询本 slice 约束存在并测试非法写入失败，不能只依赖 Java enum。
 
 ---
 
-## V002__memory.sql — 记忆表（M3 时加）
+## V006 memory slice — 记忆表（M3 时加）
 
 ```sql
 CREATE EXTENSION IF NOT EXISTS vector;
@@ -977,54 +1088,22 @@ CREATE INDEX idx_memory_embedding ON memory_card
 ## Migration 与里程碑边界
 
 ```text
-V001__core_schema.sql  完整核心关系结构（M1/M2 表全部存在，外键一次闭环）
-V002__memory.sql       M3：pgvector extension + memory_card
-后续 V003+            只做向前兼容的增量结构变更
+V001__m1_data_plane.sql       workspace/admin/route/profile/standalone session/invocation/exchange/event publication
+V002__m1_worker_runtime.sql    worker/process/command/replay/session credential，以及 session 的 Worker 字段
+V003__m2_task_model.sql        policy bundle/request/spec/plan/task，以及 session 的 nullable task 关联
+V004__m2_dispatch_budget.sql   dispatch message/artifact link/budget，以及 trace 与 task tree 约束
+V005__m2_evidence_ops.sql      artifact/evidence/verification/inbox/operation log/cancellation outbox
+V006+                         automation、memory/pgvector 等按实现 slice 继续向前迁移
 ```
 
-V001 的可执行建表顺序：
+关键原则：
 
-```text
-workspace
-→ admin_bootstrap_credential
-→ admin_session
-→ workspace_root
-→ provider_route
-→ provider_pricing
-→ agent_profile
-→ agent_profile_version
-→ worker
-→ worker_credential
-→ task
-→ budget_node
-→ ALTER task ADD CONSTRAINT root_budget_id → budget_node(id)
-→ session
-→ session_process
-→ invocation
-→ worker_command
-→ worker_event_receipt
-→ session_credential
-→ exchange
-→ artifact
-→ artifact_reference
-→ a2a_message
-→ a2a_message_artifact
-→ inbox_item
-→ inbox_item_artifact
-→ operation_log
-→ checkpoint_execution
-→ task_goal_verification
-→ cancellation_outbox
-→ domain_event
-→ event_publication
-```
+- M1 空库只出现 M1 实际读写的表；验收额外断言 `task_request`、`dispatch_message`、`evidence_claim` 不存在。
+- V002 必须支持从已含真实 M1 exchange 的 V001 数据库无损升级，而不只是空库成功。
+- V003+ 增加关联时，`session.task_id` 与 `artifact.task_id` 永久允许为空，以支持 standalone session；M2
+  编排流由 application service 要求非空。
+- 一个 migration 内可以先创建双方表再 `ALTER TABLE` 补循环外键；不要求外键目标从项目第一天存在。
+- migration 一旦进入共享环境不可修改；设计尚未实现时允许继续修改本规格草案，首个 SQL 落地后按 append-only 演进。
 
-M1 **只使用**本地管理认证、Workspace Root、Provider Route/Pricing、Profile、Worker/Worker Credential、
-standalone Session、Session Process、Invocation、Worker Command、Worker Event Receipt、Session Credential、
-Exchange、Domain Event 和 Event Publication；
-Task/A2A/Inbox/Checkpoint 表已存在但没有应用入口。M2 开启编排入口后才写入这些表。
-`session.task_id` 和 `artifact.task_id` 永久允许为空，以支持 standalone session；M2 创建的编排记录
-由应用服务验证其非空。不存在“先引用未来表、以后再补目标表”的 migration 状态。
-
-Flyway 验收：对全新 PostgreSQL 16 数据库执行 `migrate` 必须一次成功；随后验证所有 FK 目标、
-索引和约束均存在，再启动应用。
+Flyway 验收：每个 slice 都要在 PostgreSQL 16 上验证 `0 → current` 空库迁移和 `previous → current` 带数据升级，
+随后执行 `validate`、约束负例与关键查询索引检查。

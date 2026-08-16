@@ -234,11 +234,11 @@ hearth.artifact.local.base-path=${user.home}/.hearth/artifacts
 
 ### Artifact 引用保护（防悬空引用）
 
-G4C+E 要求所有结论长期可通过 Artifact 独立核验。7 天后删除会破坏这个保证。
+G4C+E 要求 Verification 使用的材料在 retention 期内可寻址；Artifact 本身不等于结论。
 
 清理规则：**被引用的 Artifact 不得删除**。引用来源包括：
 - 未关闭的 Inbox 条目（`inbox_item_artifact`）
-- checkpoint_execution 记录（`evidence_artifact_id`）
+- verification_record 关联（`verification_artifact`）
 - operation_log 快照（`snapshot_artifact_id`）
 - memory_card 来源（`source_session_ids` 对应的 exchange/artifact）
 
@@ -246,6 +246,9 @@ G4C+E 要求所有结论长期可通过 Artifact 独立核验。7 天后删除�
 加行锁并再次确认引用数为 0，随后将 `status` 改为 `DELETED`、清空内容/存储路径，保留
 `artifact_id + deleted_at + sha256 + size_bytes` tombstone。这样历史引用返回 410 和可核验摘要，
 而不是无法解释的 404。具体 Schema 见 `docs/03-schema.md`。
+
+安全事件例外：管理员可以执行 `SECURITY_PURGE` 强制清除泄露内容并保留最小审计 tombstone；所有依赖该
+Artifact 的 VerificationRecord 同事务转 `INVALIDATED`。普通 retention/agent 无权绕过引用保护。
 
 ---
 

@@ -10,7 +10,7 @@ Hearth 把它们拆成两个**正交平面**，各自独立演进、独立失败
 ```
                     ┌──────────────────────────────────────┐
                     │           Orchestrator               │
-                    │  Task / A2A / Budget / Scheduler     │
+                    │ Task/Spec/Plan / Dispatch / Budget   │
                     └───────┬──────────────────┬───────────┘
                             │                  │
              控制面 Control │                  │ 数据面 Data
@@ -25,7 +25,8 @@ Hearth 把它们拆成两个**正交平面**，各自独立演进、独立失败
                 ┌───────────────────┐   ┌─────────────────────┐
                 │ claude / codex /  │──▶│  上游模型 API        │
                 │ gemini / opencode │   │  anthropic/openai/…  │
-                └───────────────────┘   └─────────────────────┘
+                │ pi (RPC adapter)  │   └─────────────────────┘
+                └───────────────────┘
                             └── 进程的 BASE_URL 指向 Gateway ──┘
 ```
 
@@ -51,6 +52,7 @@ Hearth 把它们拆成两个**正交平面**，各自独立演进、独立失败
 | Codex CLI | `~/.codex/config.toml` → `[model_providers.x] base_url` | openai-responses | `body.instructions` |
 | Gemini CLI | `GOOGLE_GEMINI_BASE_URL`（**必须 API key 模式**） | gemini | `body.systemInstruction` |
 | opencode | provider 配置 `baseURL` | 随所选 provider | 同上 |
+| Pi Agent（可选，M2 后） | `PiRpcAdapter` 用隔离 `PI_CODING_AGENT_DIR/models.json` 编译 provider/model/base URL；内部 capability 走经 contract test 的 provider credential carrier | 随所选 provider | 对应协议字段 |
 
 > **Gemini 注意**：OAuth / Code Assist 登录模式不走 `generativelanguage.googleapis.com`，网关拦不到。
 > 必须用 `GEMINI_API_KEY` 模式才能进全代理。这个限制要在 UI 上显式提示。
@@ -87,12 +89,25 @@ Prompt 通过 NDJSON stdin 发送，不进入 argv。Adapter contract test 必�
 
 M2 启用 Platform MCP 时，Claude Code Adapter 追加
 `--strict-mcp-config --mcp-config {overlay}/hearth-mcp.json`。Overlay compiler 把 Profile 允许的用户 MCP 与
-Hearth MCP 合并后生成该文件；`--strict-mcp-config` 防止项目 `.mcp.json` 或用户配置绕过工具白名单。文件
+Hearth MCP 合并后生成该文件；`--strict-mcp-config` 防止项目 `.mcp.json` 或用户配置绕过 normalized
+capability / PolicyBundle 约束。文件
 权限为 0600，Session 终止时撤销 token 并删除。M1 不启用 MCP，不传这两个参数。
 内置工具另由锁定版本支持的 `--tools`/`--disallowedTools` 和本地 fail-closed hook wrapper 双层约束；MCP
 strict config 不能替代 Bash/Edit/Read 等内置工具治理。
 
+### Pi RPC Adapter：控制通道与模型数据通道仍然分离
 
+Pi 只作为 Worker 上的可选外部 runtime，不嵌入 Java 核心。`PiRpcAdapter` 用 LF-delimited JSONL stdin/stdout
+驱动 `prompt/steer/follow_up` 并把事件归一化；Pi 自身的 provider transport 继续生成对应 wire request，再把
+base URL 指向 Hearth Gateway。Orchestrator 不理解 Pi JSONL，Gateway 也不解析 Pi RPC。
+
+Pi project/global Extension/Skill/Template/context 默认禁用；Worker 使用固定 argv allowlist、隔离的
+`PI_CODING_AGENT_DIR` 和 Worker-owned `models.json` 编译 route，因为 Pi 没有通用 `--base-url` 参数。RPC 看见
+tool call 只构成 `OBSERVE_ONLY`；只有 OS/container sandbox，或“禁用 built-in tools + Hearth-owned Broker
+Extension”通过验收后，Adapter 才能分别声明 `SANDBOX_ENFORCED` 或 `BROKERED`。Pi v0.84.1 只有
+`agent_settled` 映射为 Invocation `semantic_completed`；`message_end`/`agent_end` 不能提前结束。Pi 原生 session
+文件只能作为 Worker 管理的 ResumeDescriptor carrier，Session/Invocation/Exchange 的真相源仍是 Postgres。
+完整边界见 `docs/15-pi-agent-adr.md`。
 
 给每个 agent 进程发一个**独立的 base_url 路径**，而不是靠 header 猜：
 
@@ -102,9 +117,15 @@ http://127.0.0.1:4517/s/{sessionId}/openai
 http://127.0.0.1:4517/s/{sessionId}/gemini
 ```
 
-理由：所有 CLI 都支持带路径的 base_url，但对自定义 header 的支持参差不齐
-（Claude Code 有 `ANTHROPIC_CUSTOM_HEADERS`，Codex 有 `http_headers`，Gemini CLI 没有）。
-路径法是唯一对四家都成立的归因手段，且天然抗并发——多个 agent 同时跑不会串。
+理由：所有首期 Adapter 都必须通过 contract test 证明其 base URL 能携带路径；对自定义 header 的支持则参差不齐
+（Claude Code 有 `ANTHROPIC_CUSTOM_HEADERS`，Codex 有 `http_headers`，Gemini CLI 没有）。路径负责稳定归因，
+但**不等于认证**。
+
+Gateway 为每个 Session 持有服务端生成的 `GatewayIngressAuthBinding`，按 adapter + wire protocol 固定唯一内部
+credential carrier。例如 M1 Claude Code/Anthropic 使用 `Authorization: Bearer`；Pi Anthropic transport 若只能通过
+provider API-key 环境变量发出 `x-api-key`，该 Session 就显式绑定 `x-api-key` carrier。Gateway 先从预期 carrier
+验证 gateway capability，拒绝缺失、重复或冲突 credential，然后移除所有内部/客户端 credential，再从服务端
+credential reference 注入上游密钥。不能把“Provider 原生 header 中有一个 token”误当成允许它直通上游。
 
 Base URL 后仍会追加 provider API path。M1 的 Anthropic protocol handler 只允许经过 contract test 的
 `POST /v1/messages` 和 `POST /v1/messages/count_tokens`（以及明确加入 allowlist 的后续路径），拒绝 path
@@ -214,5 +235,5 @@ Exchange    Invocation 内一次模型 API 调用
 ## 相关文档
 
 - [模块划分](./02-modules.md)
-- [A2A 与防套娃](./05-a2a-and-loops.md)
+- [Internal Dispatch、A2A Adapter 与防套娃](./05-a2a-and-loops.md)
 - [记忆分层](./06-memory.md)

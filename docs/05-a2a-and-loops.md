@@ -1,4 +1,4 @@
-# A2A 与防套娃
+# Hearth Internal Dispatch、A2A Adapter 与防套娃
 
 ## 为什么 max_depth 不够
 
@@ -14,7 +14,7 @@
 
 ## 防线 1：消息出生证
 
-每条 A2A 消息强制携带 `TraceContext`，无法伪造（由 orchestrator 签发，不由 agent 填写）：
+每条 Internal Dispatch 消息强制携带 `TraceContext`，无法伪造（由 orchestrator 签发，不由 agent 填写）：
 
 ```java
 record TraceContext(
@@ -27,7 +27,7 @@ record TraceContext(
 )
 ```
 
-**关键**：agent 不能自己构造 A2A 消息直接投递，必须经过 orchestrator 的
+**关键**：agent 不能自己构造 Dispatch 消息直接投递，必须经过 orchestrator 的
 `dispatch()`，由后者注入 trace 上下文。这是所有防线的前提——如果 agent 能伪造
 trace，后面四层全部失效。
 
@@ -37,27 +37,68 @@ trace，后面四层全部失效。
 
 ---
 
-## 防线 2：调用图环检测
+## Hearth Internal Dispatch Model
 
-### 两种目标语义必须分开
+Hearth 的核心领域不依赖 A2A SDK/type。编排层只认识稳定的内部命令：
 
 ```text
-spawn_child(targetProfileId/spawnRole)   创建新 Session；新 ID 不可能已在祖先链
-send_existing(targetSessionId)           激活已有 Session；可以做祖先 sessionId 环检测
+DispatchRequest {
+  commandId            由可信 MCP/Adapter 边界签发或派生，不依赖 LLM 随机生成
+  sourceSessionId
+  target               SpawnProfile(profileId) | ExistingSession(sessionId)
+  delegationKind       REQUEST | CONSULT | NOTIFY | ESCALATE
+  content
+  artifactRefs[]
+  traceContext          orchestrator 注入
+  budgetGrant          REQUEST 时存在
+}
 ```
 
-角色只用于 Profile 路由，不能冒充稳定身份。`send_existing` 时若 `targetSessionId` 已在祖先链则拒绝
-`request`，可按规则降级 `consult`；`spawn_child` 不做无意义的 sessionId 环检查，而由预算几何衰减、
-深度、profile pair 往返次数、message cap、重复 action fingerprint 和 checkpoint progress 共同限制。
+边界 adapter 负责转换，核心模型不 import 外部协议类型：
 
-拒绝时不是静默失败，而是返回一个结构化错误给发起方，让它知道该自己解决：
+```text
+Hearth Internal Dispatch Model
+  ├─ Hearth MCP Adapter（M2 内部主路径）
+  ├─ A2A 1.x Adapter（外部 agent 互操作）
+  └─ future ACP / other Adapter
+```
+
+MCP 是 agent 调用 Hearth 工具的入口；A2A 是未来与外部独立 agent system 互操作的协议，二者不互相替代。
+
+---
+
+## 防线 2：Task Tree 与 Session Graph 环检测
+
+### 委托类型和目标语义必须分开
+
+```text
+request + spawn_profile     创建 Child TaskRequest/TaskExecution，再创建新 Session
+consult + existing_session  不创建 Child Task，只创建 Invocation；不可继续派生
+notify                      不创建 Task；是否激活 Invocation 由 adapter 决定
+escalate                    作用于当前 Task，进入 Inbox
+```
+
+Task Tree 是业务分解树，承载 Goal、Checkpoint、预算和级联取消；Session Graph 是 agent 协作图；Invocation
+是一次激活。三者不能压成同一张图。任何 `request` 都必须产生 Child Task，禁止仅在父 Task 下新增 Session
+来绕过子任务 invariant。
+
+M2 首期 `REQUEST` 只允许 `SpawnProfile`：Child Task 与新 Session 一一建立执行归属，避免把一个已有 Session
+同时绑到两个 Task。`ExistingSession` 只允许 `CONSULT/NOTIFY`；consult 即使回到祖先 Session 也不可再派生，
+不会扩张 Task Tree。未来若允许 existing Session 承接 Child Task，必须先引入显式 task-session assignment 和
+Invocation task binding，不能复用 `session.task_id` 偷渡。
+
+角色只用于 Profile 路由，不能冒充稳定身份。spawn profile 产生新 Session，不做无意义的 sessionId 环检查，
+而由预算几何衰减、深度、profile pair 往返次数、message cap、重复 action fingerprint 和 checkpoint progress
+共同限制。
+
+违反 kind/target 约束时不是静默失败，而是返回结构化错误：
 
 ```json
-{ "error": "a2a.cycle_detected", "ancestorChain": ["session-A", "session-B", "session-A"] }
+{ "error": "dispatch.target_kind_invalid", "message": "REQUEST requires SpawnProfile" }
 ```
 
-**降级而非硬拒**：可以允许 `consult` 类型穿过环（见防线 4），因为 consult 不会
-再派生，不构成无限递归。这让「A 问 B，B 需要回头确认 A 的一个细节」这种合理场景不被误杀。
+**降级而非硬拒**：临近阈值时可把尚未提交的 request 建议降级为 `consult`，目标必须是已有 Session；consult
+不可再派生，不构成无限递归。这让「A 问 B，B 需要回头确认 A 的一个细节」不被误杀。
 
 ---
 
@@ -66,9 +107,9 @@ send_existing(targetSessionId)           激活已有 Session；可以做祖先 
 套娃真正的危害是资源耗尽。预算约束比深度约束更贴近本质，且对未知拓扑同样有效。
 
 ```
-父任务 budget: { tokens: 500k, wallMs: 30min, usd: 5.00 }
+父任务 budget: { tokens: 500k, usd: 5.00, deadline: 2026-08-13T18:00:00Z }
   ├─ 派生子任务 → 从父预算中【划拨】，不是重新发一份
-  │    子任务 budget: { tokens: 150k, ... }   父剩余: { tokens: 350k, ... }
+  │    子任务 budget: { tokens: 150k, usd: 1.50 }   父剩余: { tokens: 350k, ... }
   └─ 子任务耗尽自己的份额 → 挂起，向父申请追加
        父同意则再划拨（父自己也会减少），父拒绝则子任务必须收敛输出
 ```
@@ -76,6 +117,8 @@ send_existing(targetSessionId)           激活已有 Session；可以做祖先 
 实现要点：
 
 - 预算是**树形账本**，不是每个 agent 一个计数器
+- token/USD 是 consumable allocation；wall time 是根 Task 的绝对 deadline，不作为可重复划拨的余额
+- Child Task 的 deadline 不得晚于父 deadline，可进一步收紧
 - 划拨策略可配：`fixed`（固定额度）/ `ratio`（父剩余的 N%）/ `elastic`（先给小额，按需追加）
 - 推荐默认 `ratio: 0.3` —— 天然形成几何衰减，无需显式深度限制就会收敛
 - 网关是唯一可信的计量点（它看得到真实 token），控制面的估算只做参考
@@ -105,7 +148,7 @@ notify    单向通知，不期待回复，不可派生。
 触发以下任一条件，任务挂起并进 Inbox 等人工裁决：
 
 - 预算超出根任务额度的阈值（默认 80% 预警，100% 挂起）
-- 同一 `traceId` 内 A2A 消息数超过上限（默认 200）
+- 同一 `traceId` 内 Dispatch 消息数超过上限（默认 200）
 - 同一对 agent 之间往返超过 K 次（默认 K=4）——M2 可用
 - 「语义环」检测：连续 N 轮消息 embedding 相似度过高——**M3 才可用**（依赖 pgvector + EmbeddingModel）
 
@@ -173,11 +216,11 @@ Profile、Session、Gateway 观测和 Evidence 约束的 `synthesizer` Invocatio
 
 
 
-一个真实任务会产生几百条 A2A 消息。平铺的时间线等于没有可观测性。
+一个真实任务会产生大量 Dispatch 消息。平铺的时间线等于没有可观测性。
 
 ```
 L1  甘特图     谁在什么时间窗口干活，并行度一目了然，用于「现在卡在哪」
-L2  调用图     xyflow 画 DAG，节点=span，边=A2A 消息，配色=状态/成本
+L2  调用图     xyflow 画 Session Graph，节点=span/session，边=Dispatch，配色=状态/成本
 L3  消息详情   单条消息的完整 payload + 对应的 gateway exchange（system prompt 全文）
 ```
 
@@ -186,10 +229,22 @@ L3  消息详情   单条消息的完整 payload + 对应的 gateway exchange（
 
 ---
 
-## 对外协议
+## 对外 A2A Adapter
 
-A2A 消息格式对齐 [Google A2A spec](https://github.com/google/A2A)，不自己发明。
-理由：未来接 openclaw / hermes 这类外部 agent 时，对方大概率已经支持 A2A；
-自定义协议等于给每个新接入方增加一层翻译成本。
+截至 2026-08-13，[A2A 已发布规范](https://a2a-protocol.org/latest/specification/) 标示 latest released
+specification 为 1.0.0，[官方 releases](https://github.com/a2aproject/A2A/releases) 已有 v1.0.1 修补版本。
+Hearth 把 1.0 视为稳定协议线，并在 Adapter 依赖/contract test 中锁定具体 patch；升级由独立 ADR/依赖变更
+处理。Hearth Internal Dispatch Model 不随 A2A wire type 变化。
 
-Hearth 的 `TraceContext` 作为 A2A 消息的 metadata 扩展字段携带，不破坏协议兼容性。
+Hearth 的 trace、budget 和 delegation 语义若需要穿过 A2A 边界，必须定义 versioned extension URI，例如：
+
+```text
+https://hearth.example/extensions/trace/v1
+https://hearth.example/extensions/budget/v1
+```
+
+外部 Agent Card 在 capabilities 中声明 extension；客户端用 `A2A-Extensions` 请求头激活，服务端在响应头
+确认协商结果；扩展数据放规范允许的 metadata/extension point。未协商成功时不得假设对端理解 Hearth 的
+budget、祖先链或 fencing 语义。仅往 metadata 塞 `TraceContext` 不算协议兼容。
+
+M2 内部协作不要求实现 A2A Adapter；先用 Hearth MCP Adapter 验证领域语义，外部互操作作为后续独立 slice。

@@ -8,7 +8,7 @@
 | 层 | 内容 | 存储 | 生命周期 |
 |---|---|---|---|
 | L0 工作记忆 | 当前 session 上下文 | CLI 自己管，**平台不插手** | session 内 |
-| L1 情节记忆 | 全量事件流 | Postgres + 对象存储 | 冷存，永久，可检索 |
+| L1 情节记忆 | 全量事件流 | Postgres + 对象存储 | 冷存，按 `08-operations.md` retention 归档/删除 |
 | L2 语义记忆 | **高价值记忆卡片** | Postgres + pgvector | 长期，带衰减与复核 |
 | L3 组织记忆 | 跨 agent 决策日志 / evidence store | Postgres | 永久 |
 

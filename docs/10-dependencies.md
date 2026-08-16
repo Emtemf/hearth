@@ -1,6 +1,6 @@
 # 依赖版本清单
 
-**最后更新**：2026-08-09
+**最后更新**：2026-08-16
 **原则**：所有版本精确锁定，升级前必须查 breaking changes。
 
 ---
@@ -69,6 +69,17 @@ JUnit Jupiter       6.0.3（Boot 4.0.7 BOM）
 Testcontainers      2.0.5（Boot 4.0.7 BOM，集成测试用 PostgreSQL 容器）
 ```
 
+### 可选外部 Agent Runtime（不进入 Maven/npm 依赖图）
+
+| Runtime | 调研/首个 contract-test 基线 | 运行要求 | 许可证 | 用途 |
+|---|---|---|---|---|
+| Pi Agent | 0.84.1 | Node.js `>=22.19.0` 或固定 hash 的受信 standalone binary | MIT | M2 基础设施完成后的可选 RPC Adapter |
+
+Pi 是 Worker capability，不是 Hearth Java core、前端包或 Spring AI 依赖。Worker 注册时上报精确 Pi 版本和
+executable hash；只有兼容矩阵中的组合才能声明 `pi-rpc`。升级必须重跑固定 argv/resource isolation、LF
+framing/schema、provider credential carrier、`agent_settled` completion、tool governance、resume 和 cancel contract
+tests；仅“进程能启动”不算兼容。详细边界见 `docs/15-pi-agent-adr.md`。
+
 ---
 
 ## Maven 模块结构
@@ -79,7 +90,7 @@ hearth/                    根 pom，dependencyManagement
   hearth-gateway/          网关透传、观测、模型路由
   hearth-agent/            Profile/版本/Session overlay 编译
   hearth-worker/           WorkerClient 接口 + 本机 LocalWorkerClient 实现
-  hearth-orchestrator/     任务编排、A2A、预算账本、生命周期状态机
+  hearth-orchestrator/     Task/Spec/Plan、Internal Dispatch、预算账本、生命周期状态机
   hearth-artifact/         Artifact 元数据、内容存储与引用保护
   hearth-platform-mcp/     Hearth 平台工具的 MCP Server（M2；不含记忆实现）
   hearth-memory/           记忆分层、提炼管线（Spring AI 的模型/VectorStore 只在这里）
@@ -93,7 +104,8 @@ hearth/                    根 pom，dependencyManagement
 
 M2 再创建 `hearth-orchestrator`、`hearth-artifact` 与 `hearth-platform-mcp`；M3 创建 `hearth-memory`、`hearth-trigger`，
 并在 `hearth-trigger` 启用 Quartz/ShedLock 自动化。根 pom 只声明当前里程碑实际存在的模块，避免
-未完成模块拖累构建，但 V001 数据库结构从第一天保持完整。
+未完成模块不拖累构建；数据库按 vertical slice 增量迁移，V001/V002 只包含 M1 实际读写结构，M2 再通过
+V003+ 引入 Task/Dispatch/Evidence。迁移进入共享环境后 append-only，禁止回写。
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -335,7 +347,7 @@ flyway-core                   数据库迁移
 
 ## Spring AI 2.0 MCP Server 注意事项
 
-Hearth 把自己的工具（hearth_dispatch_a2a 等）暴露给 agent 时，用的是 Spring AI 的 MCP Server。
+Hearth 把自己的工具（`hearth_dispatch` 等）暴露给 agent 时，用的是 Spring AI 的 MCP Server。
 该依赖属于 M2 的 `hearth-platform-mcp`，不是 M3 的 `hearth-memory`。`hearth-memory` 到 M3 再通过
 application port 为同一 MCP server 增加 `hearth_retrieve_memory` 实现，MCP transport 不因此迁移。
 

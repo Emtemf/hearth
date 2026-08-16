@@ -216,8 +216,9 @@ Request body:
 }
 ```
 
-调用方不能提交 `upstreamBaseUrl`、绝对 cwd、CLI executable 或 provider secret。服务端从
-`providerRouteId` 解析协议、host 白名单、模型白名单和 credential reference；从
+调用方不能提交 `upstreamBaseUrl`、Gateway auth carrier、绝对 cwd、CLI executable、Extension/session path 或
+provider secret。服务端从 Profile/Worker capability 选择 Adapter，并按 adapter + wire protocol 生成
+`GatewayIngressAuthBinding`；从 `providerRouteId` 解析协议、host 白名单、模型白名单和 credential reference；从
 `workspaceRootId + relativeCwd` 解析 canonical path，并拒绝目录逃逸。M1 只允许 route 到与当前 CLI
 wire protocol 兼容的 endpoint，不做隐式跨协议翻译。
 
@@ -255,18 +256,34 @@ POST /api/v1/invocations/:id/cancel
 
 ---
 
-## Task（M2）
+## Task Request / Spec / Plan / Execution（M2）
+
+### POST /api/v1/task-requests
+创建原始需求，只要求 `title/brief/source`；服务端优先用 `source + externalEventId` 幂等。响应可能处于
+`INTAKE` 或 `CLARIFYING`，不强迫调用方伪造完整 Goal。
+
+### GET /api/v1/task-requests/:id
+### POST /api/v1/task-requests/:id/clarifications
+追加带 `human_stated` audit ref 的澄清；使用 request version CAS。
+
+### GET /api/v1/task-requests/:id/spec-versions
+### GET /api/v1/task-spec-versions/:id
+### GET /api/v1/task-spec-versions/:id/plan-versions
+Spec/Plan 均为 immutable；改需求或重规划创建新版本，不提供 PATCH 原地修改。
 
 ### GET /api/v1/tasks
 ### GET /api/v1/tasks/:id
 ### POST /api/v1/tasks
+只接受 `requestId/specVersionId/planVersionId` 和运行参数。服务端校验版本链一致；Task 是 Execution，创建后
+不得切换 spec/plan。
 ### POST /api/v1/tasks/:id/cancel
 
 ### GET /api/v1/tasks/:id/sessions
 该任务下所有 session。
 
-### GET /api/v1/tasks/:id/a2a-messages
-该任务的全部 A2A 消息（调用图数据源）。
+### GET /api/v1/tasks/:id/dispatch-messages
+该任务树的 Hearth Internal Dispatch 消息（调用图数据源）。外部 A2A wire payload 由 adapter 单独审计，
+不作为核心 API DTO。
 
 Response data:
 ```json
@@ -284,7 +301,8 @@ Response data:
     "id": "msg-uuid",
     "fromSessionId": "uuid",
     "toAgentRole": "coder",
-    "kind": "request",
+    "kind": "REQUEST",
+    "childTaskId": "uuid",
     "depth": 1,
     "createdAt": "..."
   }]
@@ -308,7 +326,7 @@ Query: `?status=OPEN&page=0&size=20`
 ```
 
 批准/拒绝与 Task 状态转换使用版本 CAS；旧通知、重复点击或迟到 IM 回调返回 409，不得恢复已取消或
-被其他操作推进的 Task。Task 为 `AWAITING_HUMAN` 时，所有 launch/continue/retry/resume/A2A request
+被其他操作推进的 Task。Task 为 `AWAITING_HUMAN` 时，所有 launch/continue/retry/resume/Dispatch request
 入口都受同一个 application-level gate 拦截，而不是只让 UI 隐藏按钮。
 
 ---
@@ -316,15 +334,24 @@ Query: `?status=OPEN&page=0&size=20`
 ## Artifact（M2）
 
 ### GET /api/v1/artifacts/:id
-返回元数据和 `status`：`PENDING_UPLOAD / AVAILABLE / UPLOAD_FAILED / DELETED`。
+返回元数据和 `status`：`PENDING_UPLOAD / AVAILABLE / UPLOAD_FAILED / DELETED / SECURITY_PURGED`。
 `DELETED` 仍返回 tombstone（sha256、sizeBytes、deletedAt），不会伪装成从未存在。
 
 ### GET /api/v1/artifacts/:id/content
 仅 `AVAILABLE` 返回内容，Content-Type 按 type 决定，并设置 `nosniff` 与安全下载头。
-`PENDING_UPLOAD` 返回 409，`UPLOAD_FAILED` 返回 424，`DELETED` 返回 410。
+`PENDING_UPLOAD` 返回 409，`UPLOAD_FAILED` 返回 424，`DELETED/SECURITY_PURGED` 返回 410；后者只暴露最小
+安全审计 tombstone。
 
-Artifact 引用由 `artifact_reference` 管理。被 checkpoint、Inbox、operation log、memory 或事件引用时，
-删除接口/清理器返回冲突，不得产生悬空 Evidence。
+Artifact 引用由 `artifact_reference` 管理。被 verification、Inbox、operation log、memory 或事件引用时，
+普通删除接口/清理器返回冲突。管理员安全清除是独立 API/权限，执行后关联 Verification 变为 INVALIDATED。
+
+## Evidence（M2）
+
+### GET /api/v1/tasks/:id/claims
+### GET /api/v1/evidence-claims/:id/verifications
+
+Claim 响应包含 statement、subject、sourceStateRef；Verification 包含 verifierKind/ref、method、Artifact links、
+status 与验证时 sourceStateRef。API/UI 禁止把“有 artifactIds”投影成“已验证”。
 
 ---
 
@@ -394,7 +421,7 @@ M1 本地 Web API 仍需随机管理员会话 cookie、`HttpOnly`/`SameSite=Stri
 task.status_changed
 session.ready / session.active / session.terminated / session.crashed
 exchange.response          ← 每次模型调用结束，含 token 用量
-a2a.dispatched             ← 调用图新增边
+dispatch.dispatched        ← 调用图新增边
 inbox.created              ← Inbox 新条目，触发 badge 更新
 budget.consumed            ← 预算消耗更新
 gateway.degraded           ← 观测等级降级警告

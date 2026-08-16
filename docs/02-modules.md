@@ -7,7 +7,7 @@
 │                        入口层（触发层）                        │
 │          飞书 / Telegram / Web UI / cron / webhook            │
 └─────────────────────────┬───────────────────────────────────┘
-                          │ Task 对象
+                          │ TaskRequest
 ┌─────────────────────────▼───────────────────────────────────┐
 │                       任务编排模块                             │
 │          接收 → 拆解（planner）→ 分配 → 生命周期管理           │
@@ -16,7 +16,7 @@
 ┌──────▼──────────┐                  ┌─────────▼──────────────┐
 │   Agent 管理模块  │                  │       网关模块           │
 │  Profile / 版本  │                  │  流量拦截 / system prompt│
-│  约束 / 工具白名单│                  │  模型路由 / 成本追踪      │
+│ Capability/Policy │                  │  模型路由 / 成本追踪      │
 └──────┬──────────┘                  └────────────────────────┘
        │ 产出
 ┌──────▼──────────┐
@@ -56,7 +56,8 @@
 ```
 名称 / 角色标识    architect | coder | reviewer | assistant | ...（可自定义）
 System prompt    该 agent 的"人格"和专长描述
-工具白名单        可以调用哪些工具（read_file / write_file / bash / search / ...）
+能力集合          normalized capabilities（filesystem.read / codegraph.query / docs.official ...）
+Policy Bundle     版本化的条件规则；Adapter 再映射为 CLI/MCP 具体工具名
 约束列表          每条约束 + 处置方式（auto_terminate / suspend_wait）
 首选模型          opus / sonnet / haiku / deepseek / ... 按角色需求选
 记忆范围          该 agent 能看到哪些 L2 记忆（按 workspace + role + tag 过滤）
@@ -79,13 +80,18 @@ reviewer 刻意使用与 coder 不同厂商的模型：Claude 监察 Claude 可�
 每次修改 Profile 生成新版本（版本号 + 时间戳）。每个 session 记录使用的 Profile 版本。
 这解决"为什么上周 agent 做了这个决定"的可追溯问题。
 
+跨项目工作流规则使用 immutable `PolicyBundleVersion`，不硬编码成平台依赖。例如 coding policy 可以要求
+`CODEBASE_EXPLORATION → codegraph.query`，第三方 API 断言要求 `context7.docs | official_docs.search`。
+Adapter 把 capability 映射为当前环境实际工具；能力不可用且 policy 为 required 时 preflight fail closed。
+
 ---
 
 ## 模块三：任务编排
 
 **职责**：控制面。拆解任务、分配给 agent、管理生命周期、汇总已验证 Artifact；自身不直接调用模型。
 
-运行实体固定为：Task（业务目标）→ Session（长期逻辑会话）→ Invocation（一次激活）→ Exchange（一次模型调用）。
+需求与运行分离为 `TaskRequest → TaskSpecVersion → PlanVersion → TaskExecution`；运行实体继续按
+`TaskExecution → Session → Invocation → Exchange` 关联。
 编排层只通过 WorkerClient 启动/驱动 Session/Invocation，所有需要模型推理的 planner、reviewer、synthesizer
 都必须是受 Profile、预算、Gateway 观测和 Evidence 约束的 Agent Session。
 
@@ -100,11 +106,11 @@ reviewer 刻意使用与 coder 不同厂商的模型：Claude 监察 Claude 可�
 
 ### 约束与监察
 
-监察 agent 只做**约束检查**，不做质量判断：
+治理层只直接做**可确定的约束检查**，不冒充质量 verifier：
 
 ```
 约束检查（客观，可靠）：这个操作有没有超出白名单？
-质量判断（主观，不可靠）：这个方案好不好？← AI 会说"非常好！"
+质量判断（语义）：这个方案好不好？← 派独立 reviewer Session，保存 Review Artifact 和 VerificationRecord
 ```
 
 处置方式：
@@ -135,7 +141,9 @@ contract test；没有通过时能力自动降为 `OBSERVE_ONLY`。
 
 ### Planner 反馈回路
 
-任务完成后，评估 agent 给这次拆解打分，分数和拆法进 L2 记忆。下次 planner 遇到类似任务，检索到历史拆法作为参考。不做这个，planner 永远不进化。
+任务完成后记录 checkpoint failure、rework、human correction、Goal Verification 与最终 acceptance 等客观结果，
+用这些信号评估拆解质量；不把“agent 给自己/同伴打分”作为主要反馈。高价值拆法经记忆管线提炼后供后续
+planner 检索。
 
 ### Undo 机制
 
@@ -148,16 +156,16 @@ contract test；没有通过时能力自动降为 `OBSERVE_ONLY`。
 
 ## 模块四：触发层
 
-**职责**：把所有外部输入统一转换成 Task 对象，编排层不关心任务从哪来。
+**职责**：把所有外部输入统一转换成 TaskRequest，编排层不关心请求从哪来。
 
 ```
 来源                   转换
 ─────────────────────────────────────────
-飞书消息          →    Task（立即 / 快速通道）
-Telegram 命令     →    Task（立即 / 快速通道）
-cron 表达式       →    Task（定时触发）
-webhook           →    Task（事件触发）
-Web UI 手动       →    Task（手动触发）
+飞书消息          →    TaskRequest（优先使用 message/event ID）
+Telegram 命令     →    TaskRequest（优先使用 update/message ID）
+cron 表达式       →    TaskRequest（schedule fire ID）
+webhook           →    TaskRequest（provider event ID）
+Web UI 手动       →    TaskRequest（客户端 idempotency key）
 ```
 
 ### 飞书：双重身份（触发层 + 工具面）
@@ -217,16 +225,19 @@ Artifact 类型：
   review         审查报告（reviewer 的输出）
 ```
 
-A2A 消息传递上下文的方式：
+Internal Dispatch 传递上下文的方式：
 ```
 agent A 产出 → 存为 Artifact（带 artifactId）
-A2A 消息携带 artifactId 而不是内容本身
+Dispatch 消息携带 artifactId 而不是内容本身
 agent B 按需拉取 Artifact 内容
 ```
 
 这样避免了两个极端：
 - 只传文字摘要 → 信息丢失
 - 传完整对话历史 → B 的上下文被撑爆
+
+Artifact 只是材料，不自动证明产出正确；任务编排模块用 `EvidenceClaim + VerificationRecord` 建立断言、
+source state、verifier 和材料之间的关系。
 
 ---
 
@@ -256,8 +267,11 @@ Worker 守护进程（`hearth-worker` 独立启动）职责：
 - 每 30s 发心跳
 - 重连后上报本地存活 session 列表（状态对账）
 
-Adapter 首期为 Claude Code；Codex/Gemini/opencode 后续按同一命令与工具治理契约接入，Pi 使用 RPC JSONL
-Adapter。Adapter 能吐事件不等于能执行权限策略，能力等级必须分别上报。
+Adapter 首期为 Claude Code；Codex/Gemini/opencode 后续按同一命令与工具治理契约接入。Pi 是 M2 基础设施完成后的
+可选 RPC JSONL Adapter：Hearth 领域层不 import Pi SDK/type，Worker 使用固定 argv、隔离 `PI_CODING_AGENT_DIR`
+和受审 `models.json`，负责 LF framing、schema 校验、`agent_settled` 语义完成、事件归一化、版本化 resume 和
+resource trust。Pi RPC 能吐出 tool event 只代表可观察；在 sandbox 或禁用 built-in tools 的
+Hearth-owned Broker Extension 通过验收前，只能上报 `OBSERVE_ONLY`。
 
 详见 `docs/12-worker.md`。
 
