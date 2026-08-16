@@ -42,7 +42,10 @@ Worker 上的 Agent CLI ──> Hearth 透明网关 ──> wire-compatible Prov
 
 - **控制面**负责 Task、Session、Invocation、预算、取消、重试和人工决策门。
 - **数据面**负责模型请求的字节级透传、system prompt 观测、路由和 token/成本记录。
-- **Worker**只负责启动本机 Agent 进程并上报状态；所有调用方只能依赖 `WorkerClient`。
+- **Worker**只负责启动本机 Agent 进程并上报状态；`LocalWorkerClient` 通过本机受认证 transport 调用独立
+  `hearth-worker`，只有 daemon 可以使用 `ProcessBuilder`。
+- **Agent**以低权限身份运行，只能访问授权 workspace/overlay；不能读取 API 的 provider secret、数据库/IM/admin
+  凭证或 Worker control credential。Dispatch/Claim 不能仅凭 Session/Artifact UUID 跨 Task Tree 引用。
 - **Artifact**只存材料；`EvidenceClaim + VerificationRecord` 才说明材料证明了什么、由谁以何种方法验证。
 
 ## 项目目标
@@ -68,7 +71,8 @@ Worker 上的 Agent CLI ──> Hearth 透明网关 ──> wire-compatible Prov
 - PostgreSQL 是持久状态的唯一真相源；Redis 不保存编排主状态。
 - 网关以流式方式转发响应字节，不缓冲完整 SSE 响应。
 - Spring AI 仅用于记忆提炼、Embedding、pgvector 集成和 Hearth MCP Server，不用于实现透明网关。
-- Agent 进程只能通过 `WorkerClient` 抽象启动。
+- Agent 进程只能通过 `WorkerClient` 抽象启动；本机实现通过独立 `hearth-worker` daemon。
+- Worker 事件必须校验 `workerId + connectionId + processGeneration + launchId + eventSeq`；过期 deadline 禁止重试副作用。
 - Provider 凭证只能来自环境变量或 Secret Manager，禁止写入源码或进程参数。
 - M1 只支持 wire protocol 兼容的上游路由；跨协议转换必须由显式 Adapter 实现。
 - Pi Agent 只作为 M2 基础设施完成后的可选 RPC Adapter，不 fork，也不嵌入 Hearth Java 核心。

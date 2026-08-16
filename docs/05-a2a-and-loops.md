@@ -91,6 +91,20 @@ Invocation task binding，不能复用 `session.task_id` 偷渡。
 而由预算几何衰减、深度、profile pair 往返次数、message cap、重复 action fingerprint 和 checkpoint progress
 共同限制。
 
+### Target authorization（不可由 Schema/UUID 存在性替代）
+
+`ExistingSession(sessionId)` 是受授权的引用，不是任意可寻址的 Session。编排层在创建 Dispatch message 的同一
+事务中必须验证：
+
+1. source/target Session 属于同一 workspace，且 target 的 workspace root 在当前 Task 的允许范围内；
+2. target Task 与 source Task 满足当前策略允许的祖先、当前或后代关系；跨 Task Tree 默认拒绝；
+3. `CONSULT/NOTIFY` 的 kind 与 target 状态匹配，终止、取消、CANCELLING 或不接受输入的 Session 拒绝；
+4. `artifactRefs` 属于 source Task 或当前 PlanVersion 明确允许的 Evidence scope，并对 source Session 可见。
+
+失败返回 `dispatch.target_not_authorized`、`artifact.not_allowed_for_dispatch` 或
+`claim.artifact_scope_mismatch`，不得靠目标 UUID 已存在、role 名称相同或 agent 自报授权放行。授权结果与
+Dispatch message、artifact reference 在同一短事务提交，重试复用同一 commandId。
+
 违反 kind/target 约束时不是静默失败，而是返回结构化错误：
 
 ```json

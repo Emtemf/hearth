@@ -257,9 +257,14 @@ source state、verifier 和材料之间的关系。
 
 ```
 WorkerClient（接口）
-  LocalWorkerClient   ProcessBuilder，M1 实现
-  RemoteWorkerClient  WebSocket，M2 实现
+  LocalWorkerClient   本机受认证 transport，M1 实现
+  RemoteWorkerClient  WebSocket/TLS，M2 实现
 ```
+
+`LocalWorkerClient` 和 `RemoteWorkerClient` 都只能调用 `hearth-worker` daemon；控制面禁止直接创建
+`ProcessBuilder`。只有 Worker daemon 负责 argv、validated cwd、child environment、Adapter、事件和进程终止。
+Agent 子进程以低权限 `hearth-agent` 身份运行，不继承 `hearth-api` 的 provider/DB/IM/admin secret，也不能读取
+Worker control credential。M1 必须用 UID、目录权限和环境变量名/hash contract test 证明这条边界。
 
 Worker 守护进程（`hearth-worker` 独立启动）职责：
 - 向中心注册（workerId、version、capabilities）

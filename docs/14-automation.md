@@ -67,9 +67,35 @@ MCP 和 REST 授权层拒绝 `mayManageSchedules=false` 的 session 调用 sched
 子任务继承该字段，不能重置。达到 descendant/message/token/USD budget 或临近 deadline 后 request 建议降级为 consult，
 再超限则停止并附 Evidence 进入 Inbox。
 
----
+## 持久化与 claim contract
 
-## 工作流一：每日 AI 资讯
+上述对象不能只存在 Quartz JobData 或内存：
+
+```text
+TaskTemplateVersion {
+  id, workspaceId, version, immutableSpec, immutablePlan, createdAt
+}
+Schedule {
+  id, workspaceId, taskTemplateVersionId, status, cronExpression, zoneId,
+  overlapPolicy, misfirePolicy, maxRuntime, tokenUsdBudget, notifyPolicyId,
+  nextFireAt, lastFireAt, version, createdAt, updatedAt
+}
+ScheduleRun {
+  id, scheduleId, scheduledFireAt, status, claimOwner, claimExpiresAt,
+  taskRequestId, misfireDecision, attempt, nextAttemptAt, createdAt, updatedAt
+}
+NotificationDeliveryClaim {
+  id, eventId, channel, templateVersion, commandId, status, claimOwner,
+  claimExpiresAt, commitState, attempt, nextAttemptAt, createdAt, updatedAt
+}
+```
+
+实现时由 V006（或明确拆分的后续 migration）创建这些表。`TaskTemplateVersion` 和 Schedule 引用不可变版本，
+不能启动时覆盖历史配置。`ScheduleRun` 对 `(schedule_id, scheduled_fire_at)` 建唯一约束；Quartz/ShedLock
+只是触发和竞争协调，Postgres 才是 claim、状态、恢复和最终幂等真相源。`QUEUE_ONE` 必须有数据库可验证的最多
+一个 pending/claimed run 约束；claim lease 过期后由恢复扫描重新 claim，不重复创建 TaskRequest。通知 delivery
+同样以 `(event_id, channel, template_version)` 唯一键和稳定 commandId 幂等，`UNKNOWN_COMMIT_STATE` 不自动重发。
+
 
 **Goal**：每天生成一份与个人技术方向相关、可追溯且去重的简报，而不是转载热榜。
 

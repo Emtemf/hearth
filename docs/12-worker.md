@@ -115,6 +115,8 @@ public enum CommitState {
 `launch`、`invoke`、`cancel` 都是**命令**而不是普通 RPC：调用前由中心持久化 claim，网络重试复用
 同一 `commandId`。Worker 本地也要持久化最近命令结果；收到重复命令时返回原结果。只有
 `REJECTED_BEFORE_COMMIT` 可以自动换新 command；`UNKNOWN_COMMIT_STATE` 必须先 reconcile，禁止猜测后重放。
+每个可能产生副作用的命令还必须携带中心计算并持久化的 `deadlineAt` 快照；中心和 Worker 在 claim、backoff、
+`Retry-After`、reconcile 前检查 deadline，过期后只能返回 `REJECTED_BEFORE_COMMIT`，不能因重连延长时间。
 `AgentHandle` 可以作为 `LocalWorkerClient` 内部实现细节，但不得作为跨本机/远机的领域契约。
 
 ```java
@@ -129,8 +131,13 @@ public record WorkerInfo(
 ) {}
 ```
 
-**本地实现**：`LocalWorkerClient` 用 `ProcessBuilder` 直接启动进程。
-**远程实现**：`RemoteWorkerClient` 通过 WebSocket 发指令给远端 Worker 守护进程。
+**本地实现**：`LocalWorkerClient` 通过本机受认证 transport 调用 `hearth-worker`，不在 Hearth API 进程内使用
+`ProcessBuilder`。
+**远程实现**：`RemoteWorkerClient` 通过 WebSocket/TLS 发指令给远端 Worker 守护进程。
+
+只有 `hearth-worker` 可以使用 `ProcessBuilder`。它负责固定 executable、argv、validated cwd、child environment、
+Adapter、事件和终止；Agent 以低权限 `hearth-agent` 身份运行。`hearth-api` 与 Worker/Agent 使用不同服务身份，
+Agent 不得读取 API 的 provider/DB/IM/admin secret 或 Worker control credential。
 
 每家 CLI 由独立 Adapter 实现 `launch/invoke/event normalization/tool governance/resume validation`。
 
@@ -212,7 +219,12 @@ Worker 重连后立刻发：
   {
     type: "reconcile",
     aliveProcesses: [
-      {sessionId: "sid-A", processGeneration: 3, lastEventSeq: 184}
+      {
+        "sessionId": "sid-A",
+        "processGeneration": 3,
+        "launchId": "launch-A",
+        "lastEventSeq": 184
+      }
     ]
   }
 
@@ -230,10 +242,12 @@ Worker 重连后立刻发：
 Worker 事件统一携带 `{workerId, connectionId, sessionId, processGeneration, launchId, eventSeq,
 invocationId, eventType, payload}`。`invocationId` 对进程级事件可空，对 Invocation/Exchange 相关事件必填。
 
-中心处理一条事件时必须在**同一数据库事务**中：锁定 `worker_event_receipt` → 检查下一序号 → 更新聚合
-状态 → 插入 `domain_event` → 推进 receipt 水位 → 提交。只有提交成功后才向 Worker ACK。禁止先推进水位再写
-业务事件，否则中心在两步之间崩溃会永久丢失已经确认的事件。语义完成、stream EOF、process exit、
-transport disconnect 使用不同 eventType。
+中心处理一条事件时必须在**同一数据库事务**中按固定顺序执行：锁定 `worker`，断言 envelope 的 `workerId` 与当前
+`connectionId` 相等；锁定 `session_process`，断言 `sessionId + processGeneration + launchId` 精确匹配且 worker
+一致；锁定 `worker_event_receipt`，断言 `eventSeq == last_event_seq + 1`；应用状态转换、插入 `domain_event`、
+推进 receipt 水位；提交成功后才向 Worker ACK。旧 connection、旧 launch、旧 generation、重复或乱序事件全部
+拒绝且不推进水位。禁止先推进水位再写业务事件，否则中心在两步之间崩溃会永久丢失已经确认的事件。语义完成、
+stream EOF、process exit、transport disconnect 使用不同 eventType。重连 reconcile 必须携带 launchId。
 ```
 
 ---

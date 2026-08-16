@@ -85,7 +85,27 @@ MCP 工具 schema 的枚举值使用 lowercase wire spelling（例如 `request`�
 `UNKNOWN_COMMIT_STATE`。消息已持久化但实时广播失败时返回 `COMMITTED_WITH_WARNING`，重试同一
 内部 `commandId` 返回原 messageId，不重复投递；`UNKNOWN_COMMIT_STATE` 进入 Inbox，不允许 agent 自动重试。
 
+`existingSessionId` 不是任意 UUID：M2 application service 必须验证目标 Session 与调用方在同一 workspace，属于当前
+Task Tree 允许的祖先/当前/后代关系，使用允许的 workspace root，且状态允许接收该 kind。跨 workspace、跨 Task Tree、
+终止/不可接收 Session 均返回 `dispatch.target_not_authorized`；MCP schema 的 string 类型不能替代服务端授权。
+`artifactIds` 同样必须属于 source Task 或 PlanVersion 明确允许的 Evidence scope，不能通过猜测或泄露的 artifactId
+跨 Task 引用。
+
 **错误返回**（不会抛异常，以结构化错误返回让 agent 决定怎么处理）：
+
+```json
+{
+  "error": "dispatch.target_not_authorized",
+  "message": "目标 Session 不属于当前 workspace/Task Tree 或当前状态不可接收"
+}
+```
+
+```json
+{
+  "error": "artifact.not_allowed_for_dispatch",
+  "message": "Artifact 不在当前 Dispatch 的 Evidence scope 内"
+}
+```
 
 ```json
 {
@@ -156,8 +176,9 @@ Artifact 是 Evidence 的材料载体，但 artifactId 本身不证明任何断�
 
 ---
 
-M2 首期不提供 path 参数，防止 agent 把 allowed workspace 之外的主机文件上传。内容小于 64 KiB 可存
-Postgres，64 KiB–1 MiB 写本地 Artifact storage。未来增加 path/大文件上传时，必须由 Worker 的受限
+M2 首期不提供 path 参数，防止 agent 把 allowed workspace 之外的主机文件上传。Artifact 创建时绑定当前
+Session 和 Task（M1 standalone 时 task 可空）；返回 artifactId 不授予跨 Task 读取权。其他 Session 只有在同一
+workspace 且当前 Task/PlanVersion 的 Evidence policy 明确允许时可见。未来增加 path/大文件上传时，必须由 Worker 的受限
 `ArtifactUploadRelay` 对 `session cwd + relative path` 做 real-path canonicalization、符号链接逃逸检查和
 文件大小上限；分块上传使用 uploadId、chunk hash、总 sha256 和幂等 finalize。
 
@@ -200,6 +221,10 @@ verifier policy 调度 deterministic tool、独立 reviewer Session 或 human ve
   }
 }
 ```
+
+`hearth_submit_claim` 的每个 Artifact 必须对当前 Session 可见，并属于当前 Task 或 PlanVersion 明确允许的 Evidence
+scope；服务端在同一事务锁定/检查 Artifact scope 后才创建 Claim。任意泄露或猜测的跨 Task ID 返回
+`artifact.not_visible_to_session` 或 `claim.artifact_scope_mismatch`，不能仅因 Artifact 存在就建立证明关系。
 
 **返回**：
 ```json

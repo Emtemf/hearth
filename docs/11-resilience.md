@@ -38,6 +38,13 @@ base = 1s，max = 30s，最多 3 次
 
 **429 特殊处理**：读取响应头 `Retry-After`，按指定时间等待，不用指数退避。
 
+**Deadline contract**：Task 的绝对 `deadline_at` 向下传播，Child 只能更早；Invocation 创建时冻结
+`min(parentTaskDeadline, sessionDeadline, adapterTimeout)`，Worker command 再保存同一个有效 deadline 快照。
+claim/retry/reconcile/resume 必须在事务内检查 `now() < deadline_at`；指数退避或 `Retry-After` 若会越过 deadline，
+不得发送新命令，只写入 TIMED_OUT/FAILED 的唯一终态并生成 Inbox 证据。中心重启不能通过重新计算 deadline 延长
+既有 Invocation 或副作用 command。`UNKNOWN_COMMIT_STATE` 仍先 reconcile，但 reconcile 本身也不能越过 deadline
+发起新的副作用。
+
 ---
 
 ## 幂等
@@ -194,9 +201,12 @@ cancel，再确认进程死亡。若未来要求“网络分区也必须 10s 杀
 → 新短事务 CAS 写回”。后台 reconciler 扫描长期非终态 Invocation 并补齐唯一终态，终态写回失败不得
 只打日志后放弃。
 
----
+**Worker event fencing**：中心处理事件的事务固定为：锁定 `worker` 并验证 envelope `workerId` 与当前
+`connectionId`；锁定 `session_process` 并验证精确 `sessionId + processGeneration + launchId`；锁定
+`worker_event_receipt` 并要求 `eventSeq = last_event_seq + 1`；应用状态、写 `domain_event`、推进 receipt；提交
+成功后才 ACK。旧连接、旧 launch、旧 generation、重复和乱序事件都拒绝且不推进水位。重连 reconcile 必须携带
+`launchId`，不能只凭 sessionId/generation 猜测。
 
-## 部分失败（Partial Failure）
 
 多个子任务中部分失败，默认策略：
 - **保留已成功的**：不回滚已完成的子任务

@@ -22,7 +22,10 @@
 
 2. Claude Code 接入
    - Session 创建只接受 `providerRouteId` 与 `workspaceRootId + relativeCwd`，禁止任意 URL/绝对路径
-   - provider/model/credential/CLI/cwd preflight 后，通过 WorkerClient 启动进程
+   - 通过独立 `hearth-worker` daemon 启动 Claude Code；`LocalWorkerClient` 只走本机受认证 transport。
+   - `hearth-api`、`hearth-worker`、`hearth-agent` 使用不同服务身份；Agent UID/目录权限与 child environment
+     验收证明 provider/数据库/IM/admin secret 不可读。
+   - provider/model/credential/CLI/cwd preflight 后，由 Worker daemon 构造受控命令
    - 启动脚本注入 `ANTHROPIC_BASE_URL` 和 session 专属 gateway capability token
    - 网关剥离内部 token，并用服务端当前 credential reference 重写为 Anthropic `x-api-key`
    - Session/Invocation/Exchange 分层，至少两次 Invocation 共用一个逻辑 Session
@@ -42,7 +45,7 @@ migration 演进，不预建未来表。
 |---|---|
 | M1.0 接入 spike | Claude Code 经最小受控代理完成真实流式请求，认证头替换与 base URL 行为有 fixture/抓包证据；并实测 stream-json result 后能否接收第二条 stdin，确定 ProcessReusePolicy；spike 不直接演化成生产 Controller |
 | M1.1 数据面 | 有界请求读取、响应 streaming、Exchange 录制/partial、token usage 和协议 contract test 通过 |
-| M1.2 运行面 | bootstrap → standalone Session → 本机 Process generation → 两次单活 Invocation → 中心重启 reconcile |
+| M1.2 运行面 | bootstrap → standalone Session → 本机 `hearth-worker`/Process generation → 两次单活 Invocation → 中心重启 reconcile；不同 UID、权限和本机 transport 验收 |
 | M1.3 产品面 | 管理认证/CSRF、REST transcript、publication SSE/snapshot 收敛、最小 UI 和性能验收通过 |
 
 任何 slice 未通过其自动化出口，不提前实现下一里程碑功能。原“3–5 周”只是目标窗口，若安全、恢复或真实
@@ -67,8 +70,9 @@ M2 能力，M1 验收不能反过来依赖尚未实现的 M2 模块。
 - 从环境变量加载 `HEARTH_DB_PASSWORD`、`ANTHROPIC_API_KEY`、`HEARTH_WORKSPACE_ROOT` 和
   `HEARTH_ANTHROPIC_ALLOWED_MODELS`；缺失或路径/模型列表无效时启动明确失败。
 - 网关只监听配置的本机地址；测试日志和数据库检索确认没有 secret 或 capability token 明文。
-- LocalWorkerClient child environment 已剥离真实 provider/数据库/IM/admin credential，只含 session capability；
-  验收用 hash/变量名检查，不把 secret 本身打印进 Evidence。
+- `hearth-api`、`hearth-worker`、`hearth-agent` 使用不同服务身份；Worker daemon 构造 child environment，剥离真实
+  provider/数据库/IM/admin credential，只含 session capability；验收用 UID、权限、变量名和敏感值 hash 检查，不把
+  secret 本身打印进 Evidence。
 - 创建 standalone session 时 application service 签发一次性的 gateway capability token，明文只进入
   受保护的 `LaunchCommand` 环境，浏览器响应不含 token，数据库只存在 SHA-256 hash。
 
@@ -147,7 +151,7 @@ M2 能力，M1 验收不能反过来依赖尚未实现的 M2 模块。
    - 操作日志（undo 清单的基础）
 
 4. Artifact 存储
-   - 代码变更（diff）、文档、审查报告
+   - 代码变更（diff）、文档、审查报告；Dispatch/Claim 只能引用当前 Task/Evidence scope 可见材料
    - EvidenceClaim + VerificationRecord；Artifact 只是材料，语义评审使用独立 reviewer Session
    - Dispatch 消息携带 artifactId 传递上下文
 
@@ -156,7 +160,9 @@ M2 能力，M1 验收不能反过来依赖尚未实现的 M2 模块。
    - Session Graph（边=Internal Dispatch）与独立 Task Tree
 
 **迁移**：M2 用 V003–V005 引入 Task/Spec/Plan、Policy、Dispatch/Budget、Artifact/Evidence/Inbox/Ops；必须
-验证从带真实 Exchange 的 M1 数据库无损升级。pgvector 与 `memory_card` 在 M3 的后续 migration 引入。
+验证从带真实 Exchange 的 M1 数据库无损升级。V006 增量引入 immutable TaskTemplateVersion、Schedule、ScheduleRun
+和 notification delivery claim，覆盖 `(schedule_id, scheduled_fire_at)` 幂等、QUEUE_ONE、claim lease 恢复和
+双实例竞争；pgvector 与 `memory_card` 在 M3 的后续 migration 引入。
 
 **M2 后兼容性 slice（不阻塞 M2 核心验收）**：Pi Agent 仅在 Worker、Profile、Policy 和 Evidence 基础设施
 通过后接入。隔离 Pi config/resource、RPC framing、`agent_settled` completion、Gateway 内部认证 carrier、

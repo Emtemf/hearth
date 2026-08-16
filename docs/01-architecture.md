@@ -70,11 +70,17 @@ claude -p --input-format stream-json --output-format stream-json --verbose \
   --replay-user-messages --session-id {sessionId}
 ```
 
-cwd 不通过不存在或版本易变的 `--project-dir` 参数传递；`LocalWorkerClient` 使用
-`ProcessBuilder.directory(validatedCwd)`，远程 Worker 使用等价的无 shell 工作目录设置。
-Prompt 通过 NDJSON stdin 发送，不进入 argv。Adapter contract test 必须针对锁定的 Claude Code 版本验证
-第二条输入能否在 result 事件后继续复用同一进程；不能复用时采用“每 Invocation 新进程 + 带版本 resume”策略，
+cwd 不通过不存在或版本易变的 `--project-dir` 参数传递；`LocalWorkerClient` 通过本机受认证 transport 调用
+`hearth-worker`，由 Worker daemon 在其受限权限下执行 `ProcessBuilder.directory(validatedCwd)`；远程 Worker 使用等价的无
+shell 工作目录设置。Prompt 通过 NDJSON stdin 发送，不进入 argv。Adapter contract test 必须针对锁定的 Claude Code
+版本验证第二条输入能否在 result 事件后继续复用同一进程；不能复用时采用“每 Invocation 新进程 + 带版本 resume”策略，
 但逻辑 Session ID 不变，禁止假设所有 CLI 都是长驻进程。
+
+本机部署明确分成三类服务身份：`hearth-api` 运行控制面/Gateway 并可读取 provider secret；`hearth-worker` 只读取
+Worker credential、启动配置和 session capability；`hearth-agent` 是低权限 CLI 子进程，只能访问允许的 workspace root
+和本次 Session 所需的 overlay。Agent 不继承 API 的完整环境，也不能读取 API 的 secret、数据库凭证、Artifact/raw
+recording 或 Worker control credential。低权限 UID/文件权限是 M1 的最小进程边界；若宿主机上的用户本身是 root 或能调试
+其他进程，则不宣称这是多用户安全边界。
 
 每个 session 的 overlay 目录结构：
 ```

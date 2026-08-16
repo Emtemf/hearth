@@ -90,9 +90,10 @@ Artifact    → 只做：存储和寻址，不做内容解析
 记忆        → 只做：写入和检索，不主动触发任何操作
 ```
 
-**WorkerClient 是接口**，本机实现用 `ProcessBuilder`，远机实现用 WebSocket。
-M1 只做本机实现，但**所有调用方只能用接口，不能直接用 `ProcessBuilder`**。
-这是 M1 里唯一一个"为蜂窝预留"的设计，其他都可以推迟。
+**WorkerClient 是接口**，`LocalWorkerClient` 通过本机受认证 transport 调用独立 `hearth-worker`，远机实现用
+WebSocket/TLS。只有 Worker daemon 可以使用 `ProcessBuilder`；所有调用方只能依赖接口，不能直接启动进程。
+Agent 以低权限 `hearth-agent` 身份运行，不能继承 `hearth-api` 的 provider/数据库/IM/admin secret 或读取 Worker
+control credential。M1 必须用 UID、目录权限、环境变量名/hash 和 transport contract test 验证这条边界。
 
 ---
 
@@ -216,6 +217,8 @@ token/USD 预算扣除用 `SELECT FOR UPDATE`；wall time 用父子单调收紧�
 - Worker 对路径 canonicalize 并拒绝 `..`、符号链接逃逸和 allowed root 之外路径
 - M1 绑定 loopback 仍需随机本地管理员会话与 CSRF 防护；loopback 不是身份认证
 - Artifact 默认只接收 content；未来 path 上传只能读取 session cwd 内文件
+- Dispatch ExistingSession 必须通过 workspace/Task Tree/state authorization；Dispatch/Claim Artifact 必须通过 task/Evidence scope 检查
+- Invocation/Worker command 持久化有效 deadline；过期后禁止 retry、reconcile 或发送新的副作用命令
 
 ### 自动化
 - Schedule 只能由人或受信管理 API 创建/修改；agent 只能提交提议到 Inbox
@@ -253,7 +256,9 @@ token 绑定 `(workerId, sessionId, audience, expiresAt)`，终止时撤销。
 Artifact 传输：M2 首期由 agent 通过中心 Platform MCP 按 content 上传并返回 artifactId；未来 path/大文件上传才由
 Worker 在 session cwd 边界内读取并中继，中心不接受任意 path。
 
-M1 用本机 Worker，M2 扩展到多机，M3 用 Tailscale 跨地点。
+M1 用本机独立 Worker daemon，M2 扩展到多机，M3 用 Tailscale 跨地点。`hearth-api`、`hearth-worker`、`hearth-agent`
+使用不同服务身份；Agent 只能访问允许的 workspace/overlay，不能以 Session/Artifact UUID 存在性越过 workspace、Task
+Tree 或 Evidence scope 授权。Worker event 必须同时校验 `workerId + connectionId + processGeneration + launchId + eventSeq`。
 
 **M1 必须做的一件事：所有 agent 启动通过 `WorkerClient` 接口，不直接用 `ProcessBuilder`。**
 

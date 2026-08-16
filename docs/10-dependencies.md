@@ -89,7 +89,7 @@ hearth/                    根 pom，dependencyManagement
   hearth-core/             领域模型、ValueObject、接口定义（无 Spring 依赖）
   hearth-gateway/          网关透传、观测、模型路由
   hearth-agent/            Profile/版本/Session overlay 编译
-  hearth-worker/           WorkerClient 接口 + 本机 LocalWorkerClient 实现
+  hearth-worker/           Worker daemon、Adapter 与本机 ProcessBuilder；LocalWorkerClient 只调用其受认证 transport
   hearth-orchestrator/     Task/Spec/Plan、Internal Dispatch、预算账本、生命周期状态机
   hearth-artifact/         Artifact 元数据、内容存储与引用保护
   hearth-platform-mcp/     Hearth 平台工具的 MCP Server（M2；不含记忆实现）

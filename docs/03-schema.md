@@ -48,7 +48,7 @@ V002  M1 Worker lifecycle / command / replay / credential
 V003  M2 TaskRequest + TaskSpecVersion + PlanVersion + TaskExecution + PolicyBundleVersion
 V004  M2 internal dispatch + consumable budget
 V005  M2 Artifact + EvidenceClaim + VerificationRecord + Inbox/operation log/cancellation
-V006  M3 automation trigger extensions + memory/pgvector（可按实现 slice 继续细分）
+V006  M3 TaskTemplateVersion + Schedule/ScheduleRun + notification delivery claim + memory/pgvector（可按实现 slice 继续细分）
 ```
 
 下面的 SQL 是目标结构草案；真正实现时按上述 migration 拆分，并为每个 migration 单独做空库 migrate、
@@ -491,6 +491,7 @@ CREATE TABLE invocation (
     process_generation    BIGINT NOT NULL,
     command_id            UUID NOT NULL,
     attempt               INTEGER NOT NULL DEFAULT 1,
+    deadline_at           TIMESTAMPTZ NOT NULL, -- immutable effective deadline snapshot
     status                TEXT NOT NULL DEFAULT 'PENDING',
                           -- PENDING/RUNNING/SEMANTIC_COMPLETED/FAILED/TIMED_OUT/CANCELLING/CANCELLED
     version               BIGINT NOT NULL DEFAULT 0,
@@ -524,6 +525,10 @@ active binding，再在提交后调用 `WorkerClient.invoke`；Gateway 收到 `/
 出现多条属于数据损坏，返回 `503 gateway.invocation_binding_corrupt` 并告警，禁止猜“最近的一条”。未来如需
 并发 Invocation，必须升级 URL/header correlation 契约，不能取消此约束后继续靠 sessionId 猜测。
 
+`deadline_at` 是创建时根据父 Task、Session 和 adapter timeout 取最小值的不可变快照；重试、`Retry-After`、
+中心恢复和 reconcile 都必须先检查它。当前时间已达到或超过该值时，不能创建新的 Worker command 或继续可能
+产生副作用的 Invocation，只能写入超时/取消的终态和 Inbox 证据。
+
 ### worker_command（LAUNCH/INVOKE/standalone CANCEL 的 durable claim）
 
 ```sql
@@ -539,6 +544,7 @@ CREATE TABLE worker_command (
     result_code         TEXT,
     result_payload      JSONB,
     attempt             INTEGER NOT NULL DEFAULT 0,
+    deadline_at         TIMESTAMPTZ NOT NULL, -- command cannot be claimed after this instant
     next_attempt_at     TIMESTAMPTZ,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -556,10 +562,11 @@ CREATE UNIQUE INDEX uq_worker_command_one_launch_per_process
 ```
 
 Session/Invocation 状态变更、`worker_command` claim 和 `domain_event` 在同一短事务提交，之后才做 Worker I/O。
-相同 `commandId` 但 `payload_hash` 不同返回 `409 worker.command_payload_mismatch`。Task 级级联取消仍使用独立
-高优先级 `cancellation_outbox`，但每条 outbox 同时引用一个稳定 command claim。`session_process` 不反向保存
-`launch_command_id`，避免首条 LAUNCH 与进程代次形成不可插入的循环外键；上面的部分唯一索引保证每个代次只有
-一个 LAUNCH claim。
+相同 `commandId` 但 `payload_hash` 不同返回 `409 worker.command_payload_mismatch`。claim 查询必须同时满足
+`now() < deadline_at`；计算出的 backoff 或 `Retry-After` 不早于 deadline 时不再发送，写入唯一超时结果。
+Task 级级联取消仍使用独立高优先级 `cancellation_outbox`，但每条 outbox 同时引用一个稳定 command claim。
+`session_process` 不反向保存 `launch_command_id`，避免首条 LAUNCH 与进程代次形成不可插入的循环外键；上面的
+部分唯一索引保证每个代次只有一个 LAUNCH claim。
 
 ### worker_event_receipt（控制面事件重放水位）
 
@@ -567,6 +574,8 @@ Session/Invocation 状态变更、`worker_command` claim 和 `domain_event` 在�
 CREATE TABLE worker_event_receipt (
     session_id         UUID NOT NULL REFERENCES session(id),
     process_generation BIGINT NOT NULL,
+    worker_id          TEXT NOT NULL REFERENCES worker(id),
+    connection_id      UUID NOT NULL,
     launch_id          UUID NOT NULL,
     last_event_seq     BIGINT NOT NULL DEFAULT 0,
     updated_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -577,7 +586,10 @@ CREATE TABLE worker_event_receipt (
 ```
 
 Worker 对每代进程生成从 1 单调递增的 `eventSeq`，本地持久化未确认事件；中心按此表的水位去重、确认
-并在断线后请求重放。业务可见顺序使用提交后分配的 `event_publication.publication_seq`，两种序号用途不同。
+并在断线后请求重放。接收事务必须先锁定 `worker`，验证 envelope 的 `workerId` 与当前 `connection_id`，再锁定
+`session_process` 验证精确 `processGeneration + launchId`，最后锁定 receipt 检查 `eventSeq = last_event_seq + 1`。
+旧 connection、旧 launch、旧 generation、重复或乱序事件都不得推进 receipt。提交 `domain_event` 与 receipt
+水位后才 ACK。业务可见顺序使用提交后分配的 `event_publication.publication_seq`，两种序号用途不同。
 
 ---
 
@@ -752,6 +764,7 @@ CREATE TABLE dispatch_message (
     acknowledged_at     TIMESTAMPTZ,
     UNIQUE (from_session_id, command_id),
     UNIQUE (trace_id, span_id),
+    UNIQUE (id, source_task_id),
     FOREIGN KEY (from_session_id, source_task_id) REFERENCES session(id, task_id)
 );
 
@@ -760,19 +773,24 @@ CREATE INDEX idx_dispatch_from_session ON dispatch_message(from_session_id);
 
 CREATE TABLE dispatch_message_artifact (
     message_id      UUID NOT NULL,
+    source_task_id  UUID NOT NULL,
     artifact_id     UUID NOT NULL,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (message_id, artifact_id),
     FOREIGN KEY (message_id) REFERENCES dispatch_message(id) ON DELETE CASCADE,
-    FOREIGN KEY (artifact_id) REFERENCES artifact(id)
+    FOREIGN KEY (artifact_id, source_task_id) REFERENCES artifact(id, task_id),
+    FOREIGN KEY (message_id, source_task_id) REFERENCES dispatch_message(id, source_task_id)
 );
 ```
 
 Application service 强制：`REQUEST` 只能使用 `SPAWN_PROFILE`，创建 Child TaskRequest/Task 和新 Session 后回填
 `child_task_id`；`CONSULT/NOTIFY` 才能使用 `EXISTING_SESSION`，`ESCALATE` 作用于当前 Task；后三者的
-`child_task_id` 必须为空。目标字段满足与 kind 对应的互斥约束。外部 A2A wire message 只存在于 adapter，
-不得直接持久化为 core domain type。API/MCP 中的 `artifactIds` 是关联表投影；同事务写
-`artifact_reference(referrer_type='dispatch_message')`。
+`child_task_id` 必须为空。目标字段满足与 kind 对应的互斥约束。`EXISTING_SESSION` 不能只按 UUID 存在性接受：
+目标 Session 必须与 source Session 在同一 workspace，且满足当前 Task Tree 的允许祖先/当前/后代关系、workspace
+root 范围和可接收状态；不满足时返回 `dispatch.target_not_authorized`。外部 A2A wire message 只存在于 adapter，
+不得直接持久化为 core domain type。API/MCP 中的 `artifactIds` 是关联表投影；每个 artifact 必须属于 source task
+或当前 PlanVersion 明确允许的 Evidence scope，并在同一事务写 `artifact_reference(referrer_type='dispatch_message')`。
+任意越界引用返回 `artifact.not_allowed_for_dispatch`，不能以普通 FK 存在性替代授权。
 
 ---
 

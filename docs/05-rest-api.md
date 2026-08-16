@@ -1,15 +1,20 @@
 # REST API 契约
 
 Web UI 和后端之间的接口定义。所有响应用统一信封：
-```json
-{ "data": {...},  "error": null }
-{ "data": null,   "error": { "code": "module.error_type", "message": "..." } }
-```
+所有响应的结构如下；具体示例见下文的成功响应和错误响应。
 
 信封适用于 JSON 业务 API；SSE 使用 `text/event-stream`，Artifact/raw 下载使用对应内容类型，Actuator 保持
 Spring Boot 健康检查契约。它们的错误仍使用稳定 code，但不能为了套信封破坏各自的 wire protocol。
 
-Base path: `/api/v1`
+成功响应示例：
+```json
+{ "data": {"example": "value"},  "error": null }
+```
+
+错误响应示例：
+```json
+{ "data": null,   "error": { "code": "module.error_type", "message": "..." } }
+```
 
 M1 首次启动先由受信环境配置幂等创建 local workspace/root/provider route/coder profile/local worker，详见
 `docs/08-operations.md`。浏览器不负责创建这些安全边界记录。
@@ -88,10 +93,13 @@ Response data:
   "createdAt": "2026-08-09T10:00:00Z",
   "endedAt": null,
   "taskId": null,
-  "latestSystemPrompt": "# Hearth\n## 愿景...",  // 最近一次 exchange 的完整 system prompt
-  "latestSystemPromptRecordingStatus": "complete"  // complete/partial/failed
+  "latestSystemPrompt": "# Hearth\n## 愿景...",
+  "latestSystemPromptRecordingStatus": "complete"
 }
 ```
+
+`latestSystemPrompt` 是最近一次 exchange 的完整 system prompt；`latestSystemPromptRecordingStatus` 取
+`complete`、`partial` 或 `failed`。
 
 ### GET /api/v1/sessions/:id/transcript
 **M1 核心接口。** 按顺序返回完整的 user/assistant/tool 对话内容。
@@ -125,11 +133,13 @@ Response data:
       "createdAt": "2026-08-09T10:00:06Z"
     }
   ],
-  "systemPrompt": "# Hearth\n## 愿景...",  // full 模式有，sidecar 为 null
+  "systemPrompt": "# Hearth\n## 愿景...",
   "totalExchanges": 3,
   "recordingStatus": "complete"
 }
 ```
+
+`systemPrompt` 在 `full` 模式返回，在 `sidecar` 模式为 `null`。
 
 ### Transcript 去重与顺序语义
 
@@ -152,9 +162,15 @@ Anthropic 请求会在每次 exchange 中重复发送此前完整 message histor
 否则任一为 `partial` 则为 `partial`。响应同时返回 gaps，避免一个汇总枚举隐藏具体缺口。
 
 ```json
-"gaps": [
-  {"exchangeId":"uuid", "reason":"parse_failure", "detail":"response event 14 malformed"}
-]
+{
+  "gaps": [
+    {
+      "exchangeId": "uuid",
+      "reason": "parse_failure",
+      "detail": "response event 14 malformed"
+    }
+  ]
+}
 ```
 
 ### GET /api/v1/sessions/:id/exchanges

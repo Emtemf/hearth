@@ -146,12 +146,19 @@ void selfPing() {
 
 ```
 你的笔记本 / 台式机
-├── Claude Code 进程
-├── Hearth 进程（网关 + 编排）
+├── hearth-api（控制面 + Gateway，UID=hearth-api，可读 provider secret）
+├── hearth-worker（Worker daemon，UID=hearth-worker，可读 Worker credential）
+├── hearth-agent（Claude Code/Pi 子进程，低权限 UID，只能访问 workspace/overlay）
 └── Postgres（Docker 或本地）
 
 Claude Code 的 ANTHROPIC_BASE_URL = http://127.0.0.1:4517/s/{sid}/anthropic
+LocalWorkerClient ──受认证本机 transport──> hearth-worker
 ```
+
+`hearth-worker` 是唯一可以使用 `ProcessBuilder` 的进程；`hearth-api` 不直接 spawn Agent。Agent 不继承 API
+环境，不得读取 provider/数据库/IM/admin secret、Artifact/raw recording 或 Worker control credential。M1 必须
+用不同 UID、0700/0600 权限和 child environment contract test 验证。该隔离不防宿主 root、同一用户调试权限或恶意
+内核模块，因此不宣称是多用户安全边界。
 
 优点：延迟最低，调试最方便，没有网络问题。
 适合：自用阶段，你就是唯一用户。
