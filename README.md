@@ -113,6 +113,7 @@ docker-compose.yml 规划中的 PostgreSQL、pgvector 与 Ollama 本地依赖
 - [Web UI 设计](docs/13-ui.md)
 - [自动化设计](docs/14-automation.md)
 - [Pi Agent 集成决策](docs/15-pi-agent-adr.md)
+- [规格治理与 Canonical Source](docs/16-spec-governance.md)
 
 ## 当前阶段如何参与
 

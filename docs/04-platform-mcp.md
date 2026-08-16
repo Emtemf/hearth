@@ -77,20 +77,31 @@ tool-call request identity 签发或确定性派生；不暴露给模型填写�
 }
 ```
 
+MCP 工具 schema 的枚举值使用 lowercase wire spelling（例如 `request`、`checkpoint`）。Adapter 入站时必须
+将其显式归一化为核心领域的 uppercase enum（例如 `REQUEST`、`CHECKPOINT`）；REST 和数据库投影使用领域值，
+不得让大小写差异由各 Controller 自行猜测。
+
 副作用结果统一区分：`COMMITTED`、`COMMITTED_WITH_WARNING`、`REJECTED_BEFORE_COMMIT`、
 `UNKNOWN_COMMIT_STATE`。消息已持久化但实时广播失败时返回 `COMMITTED_WITH_WARNING`，重试同一
 内部 `commandId` 返回原 messageId，不重复投递；`UNKNOWN_COMMIT_STATE` 进入 Inbox，不允许 agent 自动重试。
 
 **错误返回**（不会抛异常，以结构化错误返回让 agent 决定怎么处理）：
+
 ```json
 {
   "error": "dispatch.target_kind_invalid",
   "message": "REQUEST requires spawnRole"
 }
+```
+
+```json
 {
   "error": "dispatch.budget_exhausted",
   "remaining": { "tokens": 0, "usd": 0.0, "deadline": "2026-08-13T18:00:00Z" }
 }
+```
+
+```json
 {
   "error": "dispatch.escalate_requires_evidence",
   "message": "kind=escalate 时 evidenceClaimIds 不能为空"
@@ -252,8 +263,8 @@ Review Artifact 后写 VerificationRecord，不能假装由 orchestrator determi
 
 ### `hearth_get_task_context`
 
-获取当前任务的 Goal、Context、Checkpoint 列表。agent 启动时应该主动调用，
-确保理解任务目标，不靠 system prompt 里的文字记忆。
+获取当前任务固定引用的 `TaskSpecVersion`、`PlanVersion`、预算和截止时间。agent 启动时应该主动调用，
+确保理解当前冻结的任务目标和计划，不靠 system prompt 里的文字记忆。
 
 ```json
 {

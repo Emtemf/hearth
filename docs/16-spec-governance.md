@@ -21,6 +21,7 @@ AGENTS、CLAUDE 和 `.claude/rules` 是入口/摘要，不得成为第二套详�
 | resilience / state transition | `docs/11-resilience.md` |
 | Worker protocol | `docs/12-worker.md` |
 | UI interaction | `docs/13-ui.md` |
+| automation / Schedule / trigger semantics | `docs/14-automation.md` |
 | Pi Agent RPC Adapter 边界 | `docs/15-pi-agent-adr.md`；外部 runtime 版本归 `docs/10-dependencies.md` |
 
 ## 变更规则
