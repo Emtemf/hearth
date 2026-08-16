@@ -1,29 +1,13 @@
-# Hearth 架构硬约束
+# Hearth 架构规则路由
 
-## 网关实现
+开始相关改动前读取对应 canonical spec：
 
-- 用 Spring Boot 虚拟线程 + 同步 InputStream/OutputStream
-- 禁止引入 WebFlux / Reactor / DataBuffer（内存泄漏难调试）
-- 禁止用 Spring Cloud Gateway 的 ModifyResponseBodyGatewayFilter（会缓冲 SSE）
-- 禁止用 Spring AI ChatClient 做网关（破坏字节级透传，私有扩展会丢失）
-- 响应体绝对不缓冲，录制用独立线程 + 有界队列，满了丢弃而不是阻塞
+- 控制面 / 数据面、透明网关与 MCP milestone：`docs/01-architecture.md`
+- 技术栈与禁止项：根目录 `AGENTS.md`、`docs/00-stack-decision.md`
+- 精确依赖版本与构建模块：`docs/10-dependencies.md`
+- Pi Agent 外部 runtime / RPC Adapter 决策：`docs/15-pi-agent-adr.md`
+- 安全配置、认证、retention 与部署：`docs/08-operations.md`
+- REST/SSE 契约：`docs/05-rest-api.md`
 
-## 存储
-
-- Postgres 是主存，Redis 只做队列/锁/临时状态
-- 禁止把 agent 编排状态放 Redis（崩溃会丢失，无法恢复长任务）
-- pgvector 装在同一个 Postgres 实例，不单独部署向量数据库
-
-## 安全
-
-- API key 必须从环境变量读取，禁止写进任何 .properties / .yaml 文件
-- 启动时验证所有必需 key，缺了直接抛异常拒绝启动
-- 网关监听 127.0.0.1，不是 0.0.0.0
-
-## Spring AI 使用范围
-
-仅限以下场景，其他地方禁止引入：
-- 记忆提炼管线（ChatClient 调 Haiku 级模型）
-- L2 记忆检索（VectorStore + pgvector）
-- 语义环检测（EmbeddingModel）
-- 平台 MCP Server 暴露工具给 agent
+硬约束不在 `.claude/rules` 重复维护。发现冲突按 `docs/16-spec-governance.md` 处理，修改 canonical source 后再
+同步 README/AGENTS 等摘要。

@@ -22,7 +22,7 @@
 
 ### MCP
 
-见 `.mcp.json`（待 M1 实现 Hearth MCP server 后填入）。
+Platform MCP 从 M2 启用；M1 不创建 `.mcp.json`、不启动 MCP endpoint，也不签发 MCP audience token。
 
 ### 开发时注意
 

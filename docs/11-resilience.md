@@ -10,11 +10,11 @@
 | 场景 | 超时值 | 超时后动作 |
 |---|---|---|
 | 网关上游 API（Anthropic/OpenAI） | 120s | 返回 504，agent 收到后自行决定 |
-| A2A 消息投递 | 30s | 重试，见重试策略 |
+| Dispatch 消息投递 | 30s | 重试，见重试策略 |
 | Session 进程代次运行 | 60min（Task 级可配） | 进入进程终止流程；非终态 Invocation → TIMED_OUT |
 | Invocation first event | 30s | → FAILED，保存已脱敏 stderr 诊断 |
 | Invocation idle | 5min | → TIMED_OUT；关闭等待通道并按策略终止/保留 Session 进程 |
-| Checkpoint 等待 | 10min | 按 Task.correction.onCheckpointFail 处置 |
+| Checkpoint 等待 | 10min | 按当前 PlanVersion.correctionPolicy 处置 |
 | Inbox suspend_wait（ephemeral 任务） | 24h 发二次提醒，72h 自动取消 | → CANCELLED |
 | Inbox suspend_wait（durable 任务） | 永不自动取消，24h 发提醒 | 等人处理 |
 | 强制停机等待（Worker ONLINE/可达） | SIGTERM 后 8s，随后 SIGKILL；总终止确认 ≤10s | 仍无法确认则保持 CANCELLING 并告警 |
@@ -38,43 +38,57 @@ base = 1s，max = 30s，最多 3 次
 
 **429 特殊处理**：读取响应头 `Retry-After`，按指定时间等待，不用指数退避。
 
+**Deadline contract**：Task 的绝对 `deadline_at` 向下传播，Child 只能更早；Invocation 创建时冻结
+`min(parentTaskDeadline, sessionDeadline, adapterTimeout)`，Worker command 再保存同一个有效 deadline 快照。
+claim/retry/reconcile/resume 必须在事务内检查 `now() < deadline_at`；指数退避或 `Retry-After` 若会越过 deadline，
+不得发送新命令，只写入 TIMED_OUT/FAILED 的唯一终态并生成 Inbox 证据。中心重启不能通过重新计算 deadline 延长
+既有 Invocation 或副作用 command。`UNKNOWN_COMMIT_STATE` 仍先 reconcile，但 reconcile 本身也不能越过 deadline
+发起新的副作用。
+
 ---
 
 ## 幂等
 
 | 操作 | 幂等机制 |
 |---|---|
-| A2A 创建 | 调用 Session 生成稳定 `commandId`，`(from_session_id, command_id)` 唯一，重试返回原 messageId |
-| A2A 投递 | 已创建消息的 `messageId` 作为接收幂等键，接收方 upsert |
+| Dispatch 创建 | 可信 MCP/Adapter 边界签发或确定性派生 `commandId`，`(from_session_id, command_id)` 唯一，重试返回原 messageId |
+| Dispatch 投递 | 已创建消息的 `messageId` 作为接收幂等键，接收方 upsert |
 | 有副作用的工具/IM 操作 | 调用前持久化 claim；稳定 `commandId` 跨重试复用，返回已提交结果 |
 | Invocation 启动 | `(session_id, command_id, attempt)` 唯一，只有 CAS winner 可发 LAUNCH/CONTINUE |
-| 任务触发 | `triggerKey = hash(来源 + 内容摘要 + 分钟级时间窗)`，同窗口去重 |
+| 任务触发 | 优先 `(source, externalEventId)` 唯一；无原生 ID 时才用带短 TTL 的 fallback fingerprint，并保留可能重复的人工裁决路径 |
 | 预算扣除 | `SELECT FOR UPDATE` 行锁，扣款和记录原子完成 |
 | 网关录制 | 不要求幂等，丢了就丢了 |
-| Checkpoint 验证 | 可重复执行，同一 checkpointId 已 PASSED 不重复验证 |
+| Claim 验证 | 每次 attempt 新增 VerificationRecord；source state 不同则旧 PASSED 转 STALE，不得复用 |
 
 ---
 
 ## 状态机
 
-### Task
+### TaskRequest / TaskExecution
 
 ```
-PENDING
-  → PLANNING（planner 开始拆解）
-PLANNING
-  → RUNNING（拆解完成，分配给 agent）
-  → FAILED（拆解失败，无法开始）
+TaskRequest:
+INTAKE → CLARIFYING → SPECIFIED
+                  └→ REJECTED / CANCELLED
+
+TaskExecution（固定引用 immutable TaskSpecVersion + PlanVersion）:
+READY
+  → RUNNING
 RUNNING
   → AWAITING_HUMAN（suspend_wait 触发 / 预算达到 100% / escalate）
-  → SUCCEEDED（所有 checkpoint 通过，Goal 验证通过）
+  → VERIFYING（执行 Claim 已提交）
   → FAILED（不可恢复错误，超重试上限）
-  → TIMED_OUT（超过运行时限）
+  → FAILED（超过 deadline，terminal reason=TIMED_OUT）
   → CANCELLING（收到取消信号）
+VERIFYING
+  → SUCCEEDED（当前 spec 的所有 Goal Claim 有非 STALE 的 PASSED VerificationRecord）
+  → RUNNING（按 Correction retry / try_alternative）
+  → AWAITING_HUMAN（需要 HUMAN verifier 或决策）
+  → FAILED（不可恢复）
 AWAITING_HUMAN
   → RUNNING（人工批准且 expectedTaskVersion CAS 成功）
   → CANCELLED（人工拒绝 / ephemeral 72h 超时）
-  [全局 gate：launch/continue/retry/resume/A2A request/schedule continuation 全部拒绝]
+  [全局 gate：launch/continue/retry/resume/Dispatch request/schedule continuation 全部拒绝]
 CANCELLING
   → CANCELLED（所有子 Session 已终止）
 任意终态之前 → CANCELLING（强制取消，见强制取消）
@@ -111,7 +125,7 @@ reconcile，不能立即假定进程死亡。UI 的“正在执行”以 Invocat
 则同时执行 `Session ACTIVE → READY`；只有异常退出/无法建立连续性时才进入 `TERMINATING/CRASHED`。因此
 Session 状态与“是否正在回复”保持一致，但 UI 仍以非终态 Invocation 作最终判断。
 
-### A2A 消息
+### Internal Dispatch 消息
 
 ```
 DISPATCHED → DELIVERED → ACKNOWLEDGED
@@ -168,7 +182,7 @@ cancel，再确认进程死亡。若未来要求“网络分区也必须 10s 杀
 5. 取消中禁止启动新 session；竞态启动的 session 追加到同一 cancellationVersion
 6. 所有后代进程确认死亡后 Task → CANCELLED，与 domain_event 在同一短事务提交
 7. 无论成功、失败还是取消，必须在 finally/等价清理路径中完成所有等待通道：Worker event stream、
-   tool future、checkpoint waiter、A2A waiter 与 Invocation completion；不得留下永久等待 consumer
+   tool future、checkpoint waiter、Dispatch waiter 与 Invocation completion；不得留下永久等待 consumer
 ```
 
 **Worker 断线时的补偿**：
@@ -187,9 +201,12 @@ cancel，再确认进程死亡。若未来要求“网络分区也必须 10s 杀
 → 新短事务 CAS 写回”。后台 reconciler 扫描长期非终态 Invocation 并补齐唯一终态，终态写回失败不得
 只打日志后放弃。
 
----
+**Worker event fencing**：中心处理事件的事务固定为：锁定 `worker` 并验证 envelope `workerId` 与当前
+`connectionId`；锁定 `session_process` 并验证精确 `sessionId + processGeneration + launchId`；锁定
+`worker_event_receipt` 并要求 `eventSeq = last_event_seq + 1`；应用状态、写 `domain_event`、推进 receipt；提交
+成功后才 ACK。旧连接、旧 launch、旧 generation、重复和乱序事件都拒绝且不推进水位。重连 reconcile 必须携带
+`launchId`，不能只凭 sessionId/generation 猜测。
 
-## 部分失败（Partial Failure）
 
 多个子任务中部分失败，默认策略：
 - **保留已成功的**：不回滚已完成的子任务
@@ -229,14 +246,15 @@ Hearth 中心重启后，Postgres 里可能有非终态的任务。
 1. Flyway migration（先于任何业务逻辑）
 2. 恢复扫描（扫全部非终态 Task/Session/Invocation）：
    当前 session_process 为 LAUNCHING/ALIVE/TERMINATING → 查 Worker 在线状态 + `(sessionId, processGeneration)` 进程身份
-     ├─ Worker 在线 + 同代进程存活 → 按 worker_event_receipt.last_event_seq 重放事件并继续监控
+     ├─ Worker 在线 + 同代进程存活 → M1 本机 reconcile 当前状态；M2 远机按 last_event_seq 重放并继续监控
      ├─ Worker 在线 + 同代进程已死 → Session → CRASHED；非终态 Invocation 补写 FAILED
      └─ Worker 离线             → Session 保持待对账并显示 STALE；超过恢复期限才标 CRASHED
    READY + RESUME_PER_INVOCATION + 当前无存活进程 → 正常可恢复状态，不标 CRASHED
    非终态 Invocation           → 检查 semantic completion/进程/事件水位，terminal reconciler 只写一个终态
    AWAITING_HUMAN               → 保持不动，人还没回复；所有自动执行入口继续受 gate 拦截
    CANCELLING                   → 继续执行取消流程（重发 SIGTERM）
-   PLANNING                     → 重新触发 planner（幂等，安全）
+   CLARIFYING 的 TaskRequest    → 保持等待或恢复 context-gathering command（幂等）
+   READY 的 TaskExecution      → 重新执行尚未 committed 的 launch command，不重新生成 spec/plan
 3. 恢复扫描完成后，开始接受新请求
 ```
 
@@ -276,17 +294,21 @@ Session 只保存带版本的 `ResumeDescriptor`，不保存可被任意 CLI 解
 ```json
 {
   "adapterType": "claude-code",
+  "descriptorSchemaVersion": 1,
   "adapterVersion": 1,
   "cliVersion": "2.1.226",
   "externalSessionId": "provider-issued-id",
   "carrier": "native-jsonl",
+  "carrierRef": "worker-managed-relative-reference",
+  "carrierSha256": "hex",
   "issuedAt": "...",
   "lastVerifiedAt": "..."
 }
 ```
 
 恢复前由对应 Adapter 校验类型、schema/CLI 版本和 carrier，并重新解析 `providerRouteId` 当前的 credential
-reference。原生恢复失败时创建新 continuity generation，用 Goal、Checkpoint、Transcript 与 Artifact 重建
+reference。Pi 等外部 runtime 的原生 session 只能作为恢复材料，Hearth Postgres 仍是 Session/Invocation/Exchange
+真相源；`carrierRef` 必须是 Worker 管理的相对引用，且 hash 校验失败或越界时 fail closed。原生恢复失败时创建新 continuity generation，用 Goal、Checkpoint、Transcript 与 Artifact 重建
 上下文，UI 标记 `continuity=degraded`；禁止静默假装原生上下文已恢复。进程 owner lease 必须包含 generation、
 expiry 和 CAS takeover，避免重启后旧 lease 永久阻塞。
 
@@ -324,7 +346,8 @@ agent 读到后能重新锚定任务目标。
 BIGSERIAL event_id 当提交顺序**。原因：多机时钟会漂移，而 PostgreSQL sequence 的分配顺序也不等于事务
 提交顺序。时间戳只用于展示和超时计算。
 
-`wallMs` 预算的计量：用 Session 开始和结束的时间差（中心时钟），不用 Worker 本地时钟。
+wall time 不作为 budget node 的可划拨余额。根 Task 保存中心时钟计算的绝对 `deadline_at`，Child deadline
+只能相同或更早；Session/Invocation 仍有独立 timeout。token/USD 才进入可消费预算和划拨账本。
 
 ---
 
@@ -335,7 +358,7 @@ BIGSERIAL event_id 当提交顺序**。原因：多机时钟会漂移，而 Post
 - Hearth 内部 HTTP/WebSocket：请求头或 envelope 携带 `X-Trace-Id: {traceId}`
 - Provider 上游：默认剥离 `X-Trace-Id` 等 Hearth 内部头，Gateway 通过本地 Exchange 关联追踪；只有
   provider route 明确声明并测试过的 vendor metadata 字段才可发送，避免泄露内部拓扑标识
-- A2A 消息：TraceContext 已含 traceId
+- Internal Dispatch/A2A Adapter：TraceContext 已含 traceId
 - Worker 日志：Worker 向中心上报日志时带 traceId
 
 查一个任务的全部日志：`grep traceId=xxx` 或 SQL `WHERE trace_id = 'xxx'`。

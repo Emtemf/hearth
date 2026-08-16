@@ -146,12 +146,19 @@ void selfPing() {
 
 ```
 你的笔记本 / 台式机
-├── Claude Code 进程
-├── Hearth 进程（网关 + 编排）
+├── hearth-api（控制面 + Gateway，UID=hearth-api，可读 provider secret）
+├── hearth-worker（Worker daemon，UID=hearth-worker，可读 Worker credential）
+├── hearth-agent（Claude Code/Pi 子进程，低权限 UID，只能访问 workspace/overlay）
 └── Postgres（Docker 或本地）
 
 Claude Code 的 ANTHROPIC_BASE_URL = http://127.0.0.1:4517/s/{sid}/anthropic
+LocalWorkerClient ──受认证本机 transport──> hearth-worker
 ```
+
+`hearth-worker` 是唯一可以使用 `ProcessBuilder` 的进程；`hearth-api` 不直接 spawn Agent。Agent 不继承 API
+环境，不得读取 provider/数据库/IM/admin secret、Artifact/raw recording 或 Worker control credential。M1 必须
+用不同 UID、0700/0600 权限和 child environment contract test 验证。该隔离不防宿主 root、同一用户调试权限或恶意
+内核模块，因此不宣称是多用户安全边界。
 
 优点：延迟最低，调试最方便，没有网络问题。
 适合：自用阶段，你就是唯一用户。
@@ -234,11 +241,11 @@ hearth.artifact.local.base-path=${user.home}/.hearth/artifacts
 
 ### Artifact 引用保护（防悬空引用）
 
-G4C+E 要求所有结论长期可通过 Artifact 独立核验。7 天后删除会破坏这个保证。
+G4C+E 要求 Verification 使用的材料在 retention 期内可寻址；Artifact 本身不等于结论。
 
 清理规则：**被引用的 Artifact 不得删除**。引用来源包括：
 - 未关闭的 Inbox 条目（`inbox_item_artifact`）
-- checkpoint_execution 记录（`evidence_artifact_id`）
+- verification_record 关联（`verification_artifact`）
 - operation_log 快照（`snapshot_artifact_id`）
 - memory_card 来源（`source_session_ids` 对应的 exchange/artifact）
 
@@ -246,6 +253,9 @@ G4C+E 要求所有结论长期可通过 Artifact 独立核验。7 天后删除�
 加行锁并再次确认引用数为 0，随后将 `status` 改为 `DELETED`、清空内容/存储路径，保留
 `artifact_id + deleted_at + sha256 + size_bytes` tombstone。这样历史引用返回 410 和可核验摘要，
 而不是无法解释的 404。具体 Schema 见 `docs/03-schema.md`。
+
+安全事件例外：管理员可以执行 `SECURITY_PURGE` 强制清除泄露内容并保留最小审计 tombstone；所有依赖该
+Artifact 的 VerificationRecord 同事务转 `INVALIDATED`。普通 retention/agent 无权绕过引用保护。
 
 ---
 

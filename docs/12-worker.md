@@ -115,6 +115,8 @@ public enum CommitState {
 `launch`、`invoke`、`cancel` 都是**命令**而不是普通 RPC：调用前由中心持久化 claim，网络重试复用
 同一 `commandId`。Worker 本地也要持久化最近命令结果；收到重复命令时返回原结果。只有
 `REJECTED_BEFORE_COMMIT` 可以自动换新 command；`UNKNOWN_COMMIT_STATE` 必须先 reconcile，禁止猜测后重放。
+每个可能产生副作用的命令还必须携带中心计算并持久化的 `deadlineAt` 快照；中心和 Worker 在 claim、backoff、
+`Retry-After`、reconcile 前检查 deadline，过期后只能返回 `REJECTED_BEFORE_COMMIT`，不能因重连延长时间。
 `AgentHandle` 可以作为 `LocalWorkerClient` 内部实现细节，但不得作为跨本机/远机的领域契约。
 
 ```java
@@ -122,18 +124,57 @@ public record WorkerInfo(
     String workerId,
     String version,
     Set<String> capabilities,  // "claude-code", "codex", "gemini", "opencode", "pi-rpc"
+    Map<String, String> adapterVersions, // exact CLI/runtime version per capability
     Map<String, ToolGovernanceLevel> adapterGovernance,
     String hostname,
     WorkerStatus status        // ONLINE, OFFLINE, DRAINING
 ) {}
 ```
 
-**本地实现**：`LocalWorkerClient` 用 `ProcessBuilder` 直接启动进程。
-**远程实现**：`RemoteWorkerClient` 通过 WebSocket 发指令给远端 Worker 守护进程。
+**本地实现**：`LocalWorkerClient` 通过本机受认证 transport 调用 `hearth-worker`，不在 Hearth API 进程内使用
+`ProcessBuilder`。
+**远程实现**：`RemoteWorkerClient` 通过 WebSocket/TLS 发指令给远端 Worker 守护进程。
 
-每家 CLI 由独立 Adapter 实现 `launch/invoke/event normalization/tool governance/resume validation`。Pi Adapter
-使用 RPC JSONL 的 prompt/steer/follow_up 驱动 Invocation，但在受审 Extension 或 sandbox 启用前只上报
-`OBSERVE_ONLY`，不得借 Pi 内置工具绕过 Profile preflight。
+只有 `hearth-worker` 可以使用 `ProcessBuilder`。它负责固定 executable、argv、validated cwd、child environment、
+Adapter、事件和终止；Agent 以低权限 `hearth-agent` 身份运行。`hearth-api` 与 Worker/Agent 使用不同服务身份，
+Agent 不得读取 API 的 provider/DB/IM/admin secret 或 Worker control credential。
+
+每家 CLI 由独立 Adapter 实现 `launch/invoke/event normalization/tool governance/resume validation`。
+
+### Pi RPC Adapter（M2 核心验收后的可选 slice）
+
+`PiRpcAdapter` 以独立子进程运行锁定版本的 `pi --mode rpc`；Hearth 领域层不加载 Pi SDK/type。控制面和模型
+数据面保持分离：stdin/stdout 只承载 RPC，Pi provider transport 的 LLM 请求则通过 Session base URL 进入
+Gateway。
+
+- **Framing**：只按字节 `0x0A` 分帧并移除可选的 `0x0D`，不把 U+2028/U+2029 当行结束；默认
+  `maxRpcFrameBytes=8 MiB`，之后才做严格 UTF-8、JSON 和版本化 schema 校验。
+- **状态映射**：RPC command `success=true` 只映射为 command accepted；`message_end` 只上报消息观察，`agent_end`
+  只上报一次低层 run 结束；Pi v0.84.1 的 `agent_settled` 才能映射为 `semantic_completed`，并由版本 contract
+  test 固定。stdout EOF、process exit 和 transport disconnect 分别上报。Gateway Exchange 是 token/成本的可信计量点。
+- **stdout/stderr**：stdout 不允许混入日志；malformed/oversized frame 触发 `adapter.protocol_failed`。stderr 单独
+  采集脱敏摘要，不能把 token、prompt 或任意原始环境写入日志。
+- **Trust 默认值**：使用 Worker 构造的固定 argv allowlist；禁用 project/global Extension、Skill、Prompt Template、
+  AGENTS/CLAUDE context 和 package 自动安装。设置 Worker-owned、隔离的 `PI_CODING_AGENT_DIR`（必要时
+  `PI_CODING_AGENT_SESSION_DIR`），不继承用户普通 Pi 配置；调用方不能传 `-e`、`--skill`、
+  `--prompt-template`、provider config、session path、executable 或未知 flag。启动参数必须包含 contract test
+  验证过的 `--no-extensions`、`--no-skills`、`--no-prompt-templates`、`--no-context-files` 和
+  `--no-approve`（或版本等价项）；这些 `--no-*` 只禁用发现，不能替代对显式 resource path 的拒绝。
+- **Provider config**：Pi 没有通用 `--base-url` CLI 参数。Worker 在隔离 agent directory 生成受审 `models.json`
+  或使用同等受控机制，provider/protocol/host/model/credential carrier/headers/base URL 全部来自 Hearth route；
+  不接受 project/global models.json 或配置中的 shell expression。`--offline` 在 route/package policy 允许时启用。
+- **工具治理**：Pi built-in tools 在子进程内执行，能观察 event 不代表能前置阻断。默认只能声明
+  `OBSERVE_ONLY`；OS/container policy 通过验收后可声明 `SANDBOX_ENFORCED`；禁用 built-in tools 并只加载固定
+  hash 的 Hearth-owned Broker Extension 后才可声明 `BROKERED`。Extension 仍按任意代码执行对待。
+- **凭证**：Pi 仍使用 provider transport 生成 wire request，但 provider/model/base URL 由服务端 route 编译；
+  子进程只拿 session gateway capability，不拿上游 secret。capability 只走经 contract test 验证的环境变量或
+  0600 临时文件，禁止 `--api-key` 等 argv carrier。
+- **恢复**：ephemeral 进程可使用锁定版本验证过的 `--no-session`；可恢复进程只写 Worker 管理的目录。Worker
+  在启动前创建/检查 0700 目录和 0600 session carrier，并在 Pi 创建或恢复后重新验证；这些权限不是 Pi upstream
+  默认保证。`ResumeDescriptor` 保存 adapter/schema/Pi 版本、external session ID、相对 carrier、hash 和
+  `lastVerifiedAt`，不保存调用方提供的绝对路径。
+
+完整决策和验收见 `docs/15-pi-agent-adr.md`。
 
 Adapter 同时声明 `ProcessReusePolicy`：`STREAMING_STDIN` 表示 result 后可继续向同代进程写下一条 Invocation；
 `RESUME_PER_INVOCATION` 表示每次 Invocation 使用新 process generation，并由 Adapter 生成/验证
@@ -178,7 +219,12 @@ Worker 重连后立刻发：
   {
     type: "reconcile",
     aliveProcesses: [
-      {sessionId: "sid-A", processGeneration: 3, lastEventSeq: 184}
+      {
+        "sessionId": "sid-A",
+        "processGeneration": 3,
+        "launchId": "launch-A",
+        "lastEventSeq": 184
+      }
     ]
   }
 
@@ -196,10 +242,12 @@ Worker 重连后立刻发：
 Worker 事件统一携带 `{workerId, connectionId, sessionId, processGeneration, launchId, eventSeq,
 invocationId, eventType, payload}`。`invocationId` 对进程级事件可空，对 Invocation/Exchange 相关事件必填。
 
-中心处理一条事件时必须在**同一数据库事务**中：锁定 `worker_event_receipt` → 检查下一序号 → 更新聚合
-状态 → 插入 `domain_event` → 推进 receipt 水位 → 提交。只有提交成功后才向 Worker ACK。禁止先推进水位再写
-业务事件，否则中心在两步之间崩溃会永久丢失已经确认的事件。语义完成、stream EOF、process exit、
-transport disconnect 使用不同 eventType。
+中心处理一条事件时必须在**同一数据库事务**中按固定顺序执行：锁定 `worker`，断言 envelope 的 `workerId` 与当前
+`connectionId` 相等；锁定 `session_process`，断言 `sessionId + processGeneration + launchId` 精确匹配且 worker
+一致；锁定 `worker_event_receipt`，断言 `eventSeq == last_event_seq + 1`；应用状态转换、插入 `domain_event`、
+推进 receipt 水位；提交成功后才向 Worker ACK。旧 connection、旧 launch、旧 generation、重复或乱序事件全部
+拒绝且不推进水位。禁止先推进水位再写业务事件，否则中心在两步之间崩溃会永久丢失已经确认的事件。语义完成、
+stream EOF、process exit、transport disconnect 使用不同 eventType。重连 reconcile 必须携带 launchId。
 ```
 
 ---
@@ -219,16 +267,16 @@ agent 调用中心 Hearth MCP tool: hearth_save_artifact(type, content)
 M2 首期的 MCP 只接受内容，不接受 Worker 文件 path。未来增加 path/大文件上传时，Worker 提供受限的
 `ArtifactUploadRelay`（它不是第二个 MCP Server）：对 Session cwd 内相对路径做 real-path 校验，再通过带
 chunk hash、总 sha256 和幂等 finalize 的协议流式上传中心。上传失败重试 3 次，超限则 Artifact 标记
-`UPLOAD_FAILED`，对应 Checkpoint 无法通过。
+`UPLOAD_FAILED`，依赖该材料的 Verification 无法通过。
 
 ---
 
 ## 任务派发策略
 
-**M1/M2**：手动指定 + 能力标签匹配
+**M2 Task 编排**：手动指定 + 能力标签匹配（M1 standalone Session 由用户显式选本机 Worker）
 - Task 创建时可指定 `requiredCapabilities: ["claude-code"]`
 - 编排层找在线的、有对应能力的 Worker，随机选一个
-- 无可用 Worker → Task 进 `PENDING`，等 Worker 上线后自动触发
+- 无可用 Worker → Task 保持 `READY` 并记录 scheduling wait reason，等 Worker 上线后用同一 commandId 触发
 
 **推迟**：负载均衡（按 CPU/内存）、地理亲和性，开源后再加。
 
@@ -255,11 +303,15 @@ chunk hash、总 sha256 和幂等 finalize 的协议流式上传中心。上传�
 离线字典攻击；网关每次请求需要常数时间索引查询，慢哈希反而会放大延迟和 DoS 面。
 
 网关收到请求时：
-1. 从 URL 路径提取 `sessionId`
-2. 从 `Authorization: Bearer <gatewayCapabilityToken>` 取出内部 token
-3. 计算 SHA-256 并查询 `session_credential`
-4. 验证 audience=gateway、sessionId/workerId 绑定、未过期且未撤销
-5. 不匹配 → 403，记录不含 token 的安全告警
+1. 从 URL 路径提取 `sessionId`，加载服务端生成的 `GatewayIngressAuthBinding`
+2. 只从该 Session 的预期 carrier 提取内部 capability；M1 Claude Code/Anthropic 使用
+   `Authorization: Bearer`，Pi Anthropic transport 可在 contract test 通过后绑定 `x-api-key`
+3. 缺失、重复或同时出现冲突 credential carrier 时 fail closed；不能在多个 header 间猜 token
+4. 计算 SHA-256 并查询 `session_credential`，验证 audience=gateway、sessionId/workerId 绑定、未过期且未撤销
+5. 不匹配 → 403，记录不含 token 的安全告警；匹配后立即移除所有内部/客户端 credential
+
+`GatewayIngressAuthBinding` 只能由服务端按 adapter + wire protocol 选择，不能由 Session API、Agent 或 Worker
+自由提交。路径只负责归因，不是认证；允许 Pi 使用 provider-native carrier 也不代表该值可以转发上游。
 
 **关键安全步骤：协议专属上游凭证替换**
 
@@ -268,10 +320,10 @@ chunk hash、总 sha256 和幂等 finalize 的协议流式上传中心。上传�
 
 | 协议 | 先移除 | 注入上游凭证 | 必须保留/验证 |
 |---|---|---|---|
-| Anthropic Messages（静态 API key） | `Authorization`、任何客户端 `x-api-key` | `x-api-key: {ANTHROPIC_API_KEY}` | `anthropic-version`，允许配置的 `anthropic-beta` |
-| Anthropic 短期身份 token | Hearth `Authorization` | `Authorization: Bearer {identityToken}` | token 类型必须由 credential 配置显式声明 |
-| OpenAI | Hearth `Authorization`、客户端 API key | `Authorization: Bearer {OPENAI_API_KEY}` | `Content-Type` 与允许的组织/项目头 |
-| Gemini | Hearth `Authorization`、客户端 key/query | provider 配置指定的 header 或 query key | API 版本与目标 host 白名单 |
+| Anthropic Messages（静态 API key） | 绑定的 Hearth auth carrier、任何客户端 `Authorization`/`x-api-key` | `x-api-key: {ANTHROPIC_API_KEY}` | `anthropic-version`，允许配置的 `anthropic-beta` |
+| Anthropic 短期身份 token | 绑定的 Hearth auth carrier、任何客户端 provider credential | `Authorization: Bearer {identityToken}` | token 类型必须由 credential 配置显式声明 |
+| OpenAI | 绑定的 Hearth auth carrier、客户端 API key | `Authorization: Bearer {OPENAI_API_KEY}` | `Content-Type` 与允许的组织/项目头 |
+| Gemini | 绑定的 Hearth auth carrier、客户端 key/query | provider 配置指定的 header 或 query key | API 版本与目标 host 白名单 |
 
 处理顺序固定：认证 Hearth token → 删除所有内部/客户端 provider credential → 从服务端 secret
 引用加载目标凭证 → 注入协议要求的 header/query → 校验目标 host → 转发。日志、Artifact、exchange
@@ -288,12 +340,22 @@ Worker 长连接 token 与 session capability token 是两套 credential：前�
 
 ## Worker 版本管理
 
-Worker 注册时必须带版本号：
+Worker 注册时必须带 Worker 版本，以及每个外部 Adapter/runtime 的精确版本：
 ```json
-{ "workerId": "worker-A", "version": "0.2.1", "capabilities": ["claude-code"] }
+{
+  "workerId": "worker-A",
+  "version": "0.2.1",
+  "capabilities": ["claude-code", "pi-rpc"],
+  "adapterVersions": {"claude-code": "2.1.226", "pi-rpc": "0.84.1"}
+}
 ```
 
-版本兼容规则（语义化版本）：
+外部 runtime 还要在 Worker 本地 capability 配置中绑定 canonical executable path 和文件 hash。注册信息可以
+只暴露版本，不暴露本机绝对路径；中心根据兼容矩阵决定是否接受 capability。Pi 基线和升级 gate 见
+`docs/10-dependencies.md` 与 `docs/15-pi-agent-adr.md`。
+
+以下语义化版本规则只适用于 Hearth Worker 守护进程协议；外部 Adapter/runtime 不按它自动放行，必须命中各自的
+compatibility matrix：
 - patch 版本差异：允许，记录日志
 - minor 版本差异：允许，记录警告，提示升级
 - major 版本差异：拒绝注册，Worker 必须升级后才能接入
@@ -348,7 +410,10 @@ Path resolveAllowedCwd(Path configuredRoot, String relativeCwd) {
 
 `LocalWorkerClient` 不能直接继承 Hearth 中心进程的全部环境。构造 child environment 时先移除所有已知
 provider/IM/数据库/管理员凭证（至少 `ANTHROPIC_API_KEY`、数据库密码、Feishu/Telegram token），再按
-Adapter allowlist 复制必要的 PATH/locale/terminal 变量，并只注入 session capability token。M1 contract test
+Adapter allowlist 复制必要的 PATH/locale/terminal 变量，并只注入 session capability token。具体变量名/临时文件
+由服务端 `GatewayIngressAuthBinding` 与锁定 Adapter 版本决定：例如 Claude Code 可使用 auth-token carrier，Pi 的
+provider transport 可使用其原生 API-key 环境变量承载**内部** capability；两者到达 Gateway 后都先认证并剥离，
+不能原样发给 Provider。M1 contract test
 必须让测试 CLI 打印**环境变量名列表和敏感值 hash 扫描结果**，证明真实上游 key 不在 child environment；
 测试输出本身也不得打印 secret。未 sandbox 的同用户进程仍可能读取宿主其他进程信息，因此这是最小隔离，
 不是多用户安全边界。
@@ -374,10 +439,13 @@ Session 策略单独决定。取消/异常路径必须在 finally 中关闭 even
 ### Provider/CLI preflight
 
 LAUNCH 前由中心和 Worker 分层验证：provider route 已启用、model 在白名单且与 wire protocol 兼容、
-credential reference 当前可解析、CLI/Adapter 版本兼容、Worker capability 匹配、cwd 在 allowed root 内、
-ResumeDescriptor 可由该 Adapter 解析，以及 Profile 要求的工具治理等级可满足。401/403、未知模型、无效 resume、
-无法执行权限策略和配置错误属于永久错误，不交给
-CLI 无限重试；stderr 只保存脱敏摘要，且 CLI 内部重试不能突破 Hearth total deadline。
+credential reference 当前可解析、Gateway ingress auth carrier 已由该 Adapter 的 contract test 覆盖、CLI/Adapter
+版本和 executable hash 在兼容矩阵内、Worker capability 匹配、cwd 在 allowed root 内、ResumeDescriptor 可由该
+Adapter 解析，以及 Profile 要求的工具治理等级可满足。Pi 等可扩展 runtime 还必须验证使用隔离的 Worker-owned
+agent/session directories，project/global Extension/Skill/Template/context 已禁用，显式 resource path 与未知 flag
+被拒绝，或只加载受信 hash 且具备要求的 sandbox/Broker 边界。401/403、未知模型、
+无效 resume、无法执行权限策略、未知 runtime 版本和配置错误属于永久错误，不交给 CLI 无限重试；stderr 只保存
+脱敏摘要，且 CLI 内部重试不能突破 Hearth total deadline。
 
 
 

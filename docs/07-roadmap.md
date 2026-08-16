@@ -22,7 +22,10 @@
 
 2. Claude Code 接入
    - Session 创建只接受 `providerRouteId` 与 `workspaceRootId + relativeCwd`，禁止任意 URL/绝对路径
-   - provider/model/credential/CLI/cwd preflight 后，通过 WorkerClient 启动进程
+   - 通过独立 `hearth-worker` daemon 启动 Claude Code；`LocalWorkerClient` 只走本机受认证 transport。
+   - `hearth-api`、`hearth-worker`、`hearth-agent` 使用不同服务身份；Agent UID/目录权限与 child environment
+     验收证明 provider/数据库/IM/admin secret 不可读。
+   - provider/model/credential/CLI/cwd preflight 后，由 Worker daemon 构造受控命令
    - 启动脚本注入 `ANTHROPIC_BASE_URL` 和 session 专属 gateway capability token
    - 网关剥离内部 token，并用服务端当前 credential reference 重写为 Anthropic `x-api-key`
    - Session/Invocation/Exchange 分层，至少两次 Invocation 共用一个逻辑 Session
@@ -32,15 +35,17 @@
    - session 列表（时间、模型、token 用量）
    - 点进去看 system prompt 全文 + 完整对话
 
-**不做**：多 agent、记忆、调度、任何 UI 美化。Postgres 在 M1 就装好（和 M2 共用，不迁移）。
+**不做**：Task/G4C+E、Internal Dispatch/A2A Adapter、Artifact/Evidence、Inbox、MCP、记忆、调度、远程 Worker WebSocket/replay、
+精确美元成本和任何 UI 美化。Postgres/Flyway 在 M1 就装好，但只迁移当前 slice 实际使用的表；M2 用后续
+migration 演进，不预建未来表。
 
 **实施切片（顺序 gate，不并行铺模块）**：
 
 | Slice | 可独立验证的出口 |
 |---|---|
 | M1.0 接入 spike | Claude Code 经最小受控代理完成真实流式请求，认证头替换与 base URL 行为有 fixture/抓包证据；并实测 stream-json result 后能否接收第二条 stdin，确定 ProcessReusePolicy；spike 不直接演化成生产 Controller |
-| M1.1 数据面 | 有界请求读取、响应 streaming、Exchange 录制/partial、pricing snapshot 和协议 contract test 通过 |
-| M1.2 运行面 | bootstrap → Session → Process generation → 两次单活 Invocation → Worker event 重放完整闭环 |
+| M1.1 数据面 | 有界请求读取、响应 streaming、Exchange 录制/partial、token usage 和协议 contract test 通过 |
+| M1.2 运行面 | bootstrap → standalone Session → 本机 `hearth-worker`/Process generation → 两次单活 Invocation → 中心重启 reconcile；不同 UID、权限和本机 transport 验收 |
 | M1.3 产品面 | 管理认证/CSRF、REST transcript、publication SSE/snapshot 收敛、最小 UI 和性能验收通过 |
 
 任何 slice 未通过其自动化出口，不提前实现下一里程碑功能。原“3–5 周”只是目标窗口，若安全、恢复或真实
@@ -61,12 +66,13 @@ M2 能力，M1 验收不能反过来依赖尚未实现的 M2 模块。
 
 ### Given：干净、可重复的环境
 
-- 给定全新数据库，Flyway 从 0 执行 V001，一次成功且 `validate` 通过。
+- 给定全新数据库，Flyway 从 0 执行 V001/V002，一次成功且 `validate` 通过；Task/Dispatch/Evidence 表尚不存在。
 - 从环境变量加载 `HEARTH_DB_PASSWORD`、`ANTHROPIC_API_KEY`、`HEARTH_WORKSPACE_ROOT` 和
   `HEARTH_ANTHROPIC_ALLOWED_MODELS`；缺失或路径/模型列表无效时启动明确失败。
 - 网关只监听配置的本机地址；测试日志和数据库检索确认没有 secret 或 capability token 明文。
-- LocalWorkerClient child environment 已剥离真实 provider/数据库/IM/admin credential，只含 session capability；
-  验收用 hash/变量名检查，不把 secret 本身打印进 Evidence。
+- `hearth-api`、`hearth-worker`、`hearth-agent` 使用不同服务身份；Worker daemon 构造 child environment，剥离真实
+  provider/数据库/IM/admin credential，只含 session capability；验收用 UID、权限、变量名和敏感值 hash 检查，不把
+  secret 本身打印进 Evidence。
 - 创建 standalone session 时 application service 签发一次性的 gateway capability token，明文只进入
   受保护的 `LaunchCommand` 环境，浏览器响应不含 token，数据库只存在 SHA-256 hash。
 
@@ -82,7 +88,7 @@ M2 能力，M1 验收不能反过来依赖尚未实现的 M2 模块。
    - `anthropic-version` 被保留。
 5. 人为执行一次包含重复完整 history 的后续请求，验证 transcript 不重复旧 turn。
 6. 人为制造一次录制存储失败，验证响应仍持续流式返回且 exchange 标为 partial/failed。
-7. 中断 Worker event transport，在断线期间产生事件，重连后按 `(processGeneration,eventSeq)` 重放。
+7. 在进程存活时重启中心，验证本机 WorkerClient reconcile 后状态与 Postgres 收敛；远程 event replay 推迟到 M2。
 8. 提交 durable 状态后丢弃 final SSE frame，验证 UI 通过 snapshot + watermark 最终收敛。
 
 ### Then：数据库与 API 断言
@@ -96,7 +102,7 @@ M2 能力，M1 验收不能反过来依赖尚未实现的 M2 模块。
 - `/raw-request` 默认关闭；测试显式开启后仅管理员可下载，已知 credential 被移除且响应标记可能含敏感会话
   内容；agent token 调用返回 403，解析/已知 secret 无法安全处理时返回 409。
 - `domain_event.event_id` 只作内部标识；提交后 `event_publication.publication_seq` 严格递增，带 `Last-Event-ID` 重连 SSE 只补发之后的 publication。
-- Worker 重连按 eventSeq 去重重放；旧 process generation 的迟到事件不改变新代状态。
+- 本机进程重对账不接受旧 process generation 的迟到结果；远程 Worker eventSeq 重放在 M2 验收。
 - Session API 无法提交任意 upstream URL、绝对 cwd 或 executable；目录逃逸与非白名单模型被拒绝。
 - M1 管理 API 要求本地管理员会话与 CSRF，gateway token 不能越权调用；MCP 尚未启用也不签发 token。
 
@@ -129,31 +135,39 @@ M2 能力，M1 验收不能反过来依赖尚未实现的 M2 模块。
 **做什么**：
 
 1. Agent 管理
-   - Profile 配置（system prompt、工具白名单、约束）
-   - Profile 版本管理
+   - Profile 配置（system prompt、normalized capabilities、约束）
+   - Profile 与 PolicyBundleVersion 版本管理
    - 启动时注入 session 专属 base_url
 
 2. 任务编排（最小版）
-   - 接收任务 → planner 拆解 → 分配给对应 Profile
-   - A2A 消息收发（request / consult / notify 三种类型）
+   - `TaskRequest → TaskSpecVersion → PlanVersion → TaskExecution`，`CLARIFYING` 是一等阶段
+   - Hearth Internal Dispatch：request 创建 Child Task；consult 只创建 Invocation
    - 预算继承（ratio 划拨，几何衰减）
    - 祖先链环检测（存 sessionId，不存 role name）
 
 3. 约束与监察
-   - 工具调用前检查是否在白名单
+   - normalized capability → adapter tool mapping；PolicyBundle 强制 CodeGraph/官方文档等项目策略
    - `auto_terminate` + `suspend_wait` 两种处置
    - 操作日志（undo 清单的基础）
 
 4. Artifact 存储
-   - 代码变更（diff）、文档、审查报告
-   - A2A 消息携带 artifactId 传递上下文
+   - 代码变更（diff）、文档、审查报告；Dispatch/Claim 只能引用当前 Task/Evidence scope 可见材料
+   - EvidenceClaim + VerificationRecord；Artifact 只是材料，语义评审使用独立 reviewer Session
+   - Dispatch 消息携带 artifactId 传递上下文
 
 5. 调用图可视化
    - 甘特图（谁在什么时间干活）
-   - DAG（节点=session，边=A2A 消息，颜色=状态）
+   - Session Graph（边=Internal Dispatch）与独立 Task Tree
 
-**迁移**：M1 的 V001 已创建完整核心关系结构，M2 不新增 Task/A2A 核心表，只启用对应模块和入口。
-pgvector 与 `memory_card` 由 M3 的 V002 引入。
+**迁移**：M2 用 V003–V005 引入 Task/Spec/Plan、Policy、Dispatch/Budget、Artifact/Evidence/Inbox/Ops；必须
+验证从带真实 Exchange 的 M1 数据库无损升级。V006 增量引入 immutable TaskTemplateVersion、Schedule、ScheduleRun
+和 notification delivery claim，覆盖 `(schedule_id, scheduled_fire_at)` 幂等、QUEUE_ONE、claim lease 恢复和
+双实例竞争；pgvector 与 `memory_card` 在 M3 的后续 migration 引入。
+
+**M2 后兼容性 slice（不阻塞 M2 核心验收）**：Pi Agent 仅在 Worker、Profile、Policy 和 Evidence 基础设施
+通过后接入。隔离 Pi config/resource、RPC framing、`agent_settled` completion、Gateway 内部认证 carrier、
+`OBSERVE_ONLY`/sandbox/Broker 治理等级、resume 和取消必须按 `docs/15-pi-agent-adr.md` 单独验收；不能为了展示
+第二种 CLI 缩减 M2 的 architect+coder 验收。
 
 ---
 
@@ -186,21 +200,22 @@ pgvector 与 `memory_card` 由 M3 的 V002 引入。
    - 详细规格见 `docs/14-automation.md`
 
 5. Planner 反馈回路
-   - 任务完成后评估拆解质量
-   - 历史拆法进 L2 记忆
+   - 用 checkpoint failure、rework、human correction、Goal Verification 和 final acceptance 评估拆解质量
+   - 不以 planner/reviewer 自评分为主；高价值历史拆法经记忆管线提炼后进入 L2
 
 ---
 
-## 有意推迟的功能
+## 不进入当前里程碑核心验收的功能
 
-下面这些**不进前三个里程碑**，但已经在设计里预留了接口：
+下面这些能力已有扩展边界，但不会为了展示广度而阻塞或稀释 M1–M3 的核心验收：
 
 | 功能 | 为什么推迟 |
 |---|---|
-| Codex / Gemini / opencode / Pi Agent 接入 | M1 只需要 Claude Code 验证核心假设；Pi Agent 通过 RPC 模式接入（见 `docs/15-pi-agent-adr.md`），其他 CLI 按适配器接口添加即可 |
+| Codex / Gemini / opencode Adapter | M1 只用 Claude Code 验证核心假设；后续 CLI 按同一 Worker/Adapter contract 独立验收 |
+| Pi Agent RPC Adapter | 等 M2 Worker、Profile、Policy 和 Evidence 基础设施通过后再做兼容性 slice；默认只允许 `OBSERVE_ONLY`，完整边界见 `docs/15-pi-agent-adr.md` |
 | Skill 市场 | 记忆系统先跑起来，看哪些行为值得固化成 skill。**到时候必须有 sandbox 规格（seccomp + cgroups + overlayfs）**，OpenClaw 2026 年的供应链攻击教训：sandbox 是强制项，不是可选项 |
 | Skill 提案捕获 | M3 记忆系统稳定后加。机制：任务完成后检测「可重复 step sequence」，生成候选 Skill 进 Inbox 让用户确认，不自动创建 |
-| Agent Council 模式 | M2 A2A 基础设施完成后加，fan-in 合并逻辑不复杂 |
+| Agent Council 模式 | M2 Internal Dispatch 基础设施完成后加，fan-in 使用独立 synthesizer/reviewer Session |
 | 自动回滚 | 操作日志（M2）是前提；自动回滚复杂且容易出错，手动清单够用 |
 | 多用户 / 多 workspace | 自用阶段单 workspace，开源后再加隔离层 |
 | Web UI 完整设计 | M1 用最简 UI，M3 之后再投入前端设计 |
@@ -209,9 +224,11 @@ pgvector 与 `memory_card` 由 M3 的 V002 引入。
 
 ## 现在最该做的一件事
 
-验证迁移路径：把现有 Claude Code 直连或第三方中继链路，改成 Claude Code → Hearth 网关 → Anthropic。
+当前只推进 M1 迁移路径：把现有 Claude Code 直连或第三方中继链路，改成 Claude Code → Hearth 网关 → Anthropic。
 
-M2+ 阶段额外验证：通过 Hearth 启动 Pi Agent（RPC 模式），确认其工具调用和 LLM 请求均经过 Hearth 网关观测与权限控制（见 `docs/15-pi-agent-adr.md`）。
+Pi 不属于当前实现前置项。M2 核心验收通过后，再按独立 compatibility slice 验证隔离 Pi resource、RPC framing、
+`agent_settled` completion、Gateway 内部 credential carrier、准确的工具治理等级、resume 和 10 秒取消；不得把
+观察到 tool call 写成“已经过权限检查”。
 
 ```bash
 # 找到 cc-switch 写的 base_url 在哪

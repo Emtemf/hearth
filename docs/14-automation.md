@@ -7,12 +7,12 @@
 
 ## 设计原则
 
-1. **Schedule 只产生 Task，不直接执行 agent。** 所有执行继续经过预算、Profile、Artifact、Checkpoint 与生命周期规则。
+1. **Schedule 只产生根 TaskRequest，不直接执行 agent。** 受信模板生成 Spec/Plan 后才创建 TaskExecution；所有执行继续经过预算、Profile、Claim/Verification 与生命周期规则。
 2. **只有人或受信管理 API 能创建/修改 Schedule。** agent 可以提议 schedule，提议进入 Inbox，不得自行落库启用。
 3. **一次触发只允许一个根 Task。** cron 任务及其后代不能创建、启用或修改 cron，防止递归调度。
 4. **每次执行隔离。** 新 Task、新 traceId、新预算；只通过明确的记忆和 Artifact 引用继承上下文。
 5. **默认 ephemeral。** 失败重试后进入 Inbox，不永久挂住；学习和资讯任务不因遗漏一天而追补无限 backlog。
-6. **结论必须带 Evidence。** 新闻保留原始 URL、抓取时间和摘录；学习进度保留提交记录或测验结果 Artifact。
+6. **结论必须被验证。** 新闻保留原始 URL、抓取时间和摘录 Artifact，并建立 Claim/Verification；学习进度同理。
 7. **通知是结果投影，不是事实源。** Postgres 中的 Task/Inbox/Artifact 才是 source of truth。
 
 ---
@@ -34,7 +34,7 @@ Schedule {
   taskTemplateId, profileId
   overlapPolicy       SKIP | QUEUE_ONE
   misfirePolicy       SKIP | RUN_ONCE
-  maxRuntime, budget
+  maxRuntime（转成绝对 deadline）, tokenUsdBudget
   notifyPolicyId
   nextFireAt, lastFireAt
   version, createdAt, updatedAt
@@ -45,7 +45,8 @@ Schedule {
 - 默认 `misfirePolicy=SKIP`：机器关机后不补跑所有旧日报；重要周报可显式设 `RUN_ONCE`。
 - `QUEUE_ONE` 最多保留一次待运行，不形成无限队列。
 - 修改 schedule 使用 optimistic version；Quartz Job 只保存 scheduleId，不复制业务配置。
-- ShedLock 防多中心实例重复 claim；数据库唯一键 `(schedule_id, scheduled_fire_at)` 做最终幂等。
+- ShedLock 防多中心实例重复 claim；数据库唯一键 `(schedule_id, scheduled_fire_at)` 同时作为 TaskRequest 的
+  `externalEventId`，做最终幂等，不使用内容+分钟窗 hash。
 - 每个 schedule 可一键暂停；暂停不取消已经产生的 Task，取消需走 Task cancel。
 
 ### 防递归与资源上限
@@ -58,17 +59,43 @@ Schedule {
   "scheduledFireAt": "2026-08-10T00:00:00Z",
   "mayManageSchedules": false,
   "maxDescendantTasks": 8,
-  "maxA2aDepth": 3
+  "maxDispatchDepth": 3
 }
 ```
 
 MCP 和 REST 授权层拒绝 `mayManageSchedules=false` 的 session 调用 schedule 管理能力。
-子任务继承该字段，不能重置。达到 descendant/message/token/wall budget 后 request 自动降级为 consult，
+子任务继承该字段，不能重置。达到 descendant/message/token/USD budget 或临近 deadline 后 request 建议降级为 consult，
 再超限则停止并附 Evidence 进入 Inbox。
 
----
+## 持久化与 claim contract
 
-## 工作流一：每日 AI 资讯
+上述对象不能只存在 Quartz JobData 或内存：
+
+```text
+TaskTemplateVersion {
+  id, workspaceId, version, immutableSpec, immutablePlan, createdAt
+}
+Schedule {
+  id, workspaceId, taskTemplateVersionId, status, cronExpression, zoneId,
+  overlapPolicy, misfirePolicy, maxRuntime, tokenUsdBudget, notifyPolicyId,
+  nextFireAt, lastFireAt, version, createdAt, updatedAt
+}
+ScheduleRun {
+  id, scheduleId, scheduledFireAt, status, claimOwner, claimExpiresAt,
+  taskRequestId, misfireDecision, attempt, nextAttemptAt, createdAt, updatedAt
+}
+NotificationDeliveryClaim {
+  id, eventId, channel, templateVersion, commandId, status, claimOwner,
+  claimExpiresAt, commitState, attempt, nextAttemptAt, createdAt, updatedAt
+}
+```
+
+实现时由 V006（或明确拆分的后续 migration）创建这些表。`TaskTemplateVersion` 和 Schedule 引用不可变版本，
+不能启动时覆盖历史配置。`ScheduleRun` 对 `(schedule_id, scheduled_fire_at)` 建唯一约束；Quartz/ShedLock
+只是触发和竞争协调，Postgres 才是 claim、状态、恢复和最终幂等真相源。`QUEUE_ONE` 必须有数据库可验证的最多
+一个 pending/claimed run 约束；claim lease 过期后由恢复扫描重新 claim，不重复创建 TaskRequest。通知 delivery
+同样以 `(event_id, channel, template_version)` 唯一键和稳定 commandId 幂等，`UNKNOWN_COMMIT_STATE` 不自动重发。
+
 
 **Goal**：每天生成一份与个人技术方向相关、可追溯且去重的简报，而不是转载热榜。
 

@@ -1,7 +1,7 @@
 # Platform MCP Server：工具定义
 
 Hearth 自己跑一个中心 Platform MCP Server，并为每个 agent session 生成独立的受保护 MCP overlay 配置。
-这是 agent 参与平台编排的唯一正式通路——所有 A2A 派发、Artifact 上传、记忆检索、
+这是 agent 参与平台编排的唯一正式通路——所有 Internal Dispatch、Artifact 上传、记忆检索、
 Checkpoint 上报、问题上报都走这里。
 
 **为什么必须有这个**：没有 MCP Server，agent 只能靠输出文字让人解析，
@@ -11,56 +11,54 @@ Evidence 无法落地，G4C+E 框架退化成形式。
 
 ## 工具列表
 
-Platform MCP 从 M2 启用。M2 注册 `hearth_dispatch_a2a`、`hearth_save_artifact`、
-`hearth_checkpoint_done`、`hearth_get_task_context`；M3 在 memory application port 可用后才注册
+Platform MCP 从 M2 启用。M2 注册 `hearth_dispatch`、`hearth_save_artifact`、
+`hearth_submit_claim`、`hearth_get_task_context`；M3 在 memory application port 可用后才注册
 `hearth_retrieve_memory`。未到里程碑的工具不出现在 `tools/list`，不能注册一个永远返回 feature disabled 的
 假工具。M1 不启动 MCP endpoint，也不签发 MCP audience token。
 
-### `hearth_dispatch_a2a`
+所有副作用工具的内部 `commandId` 由可信 MCP transport/Adapter 使用 authenticated session、Invocation 和
+tool-call request identity 签发或确定性派生；不暴露给模型填写。transport retry 必须保留同一 request identity。
 
-派发一条 A2A 消息给另一个 agent。由 orchestrator 拦截，注入 TraceContext，
+### `hearth_dispatch`
+
+派发一条 Hearth Internal Dispatch 消息。由 orchestrator 注入 TraceContext，
 验证预算和环检测，再实际派发。agent 不能绕过此工具直接通信。
 
 ```json
 {
-  "name": "hearth_dispatch_a2a",
+  "name": "hearth_dispatch",
   "description": "向另一个 agent 派发任务或咨询。orchestrator 会自动注入 traceId、检查预算和环。",
   "inputSchema": {
     "type": "object",
-    "required": ["commandId", "target", "kind", "content"],
+    "required": ["kind", "content"],
     "properties": {
-      "commandId": {
-        "type": "string",
-        "format": "uuid",
-        "description": "调用方生成的稳定幂等键；网络重试必须复用"
-      },
       "target": {
         "oneOf": [
           {"type":"object","required":["spawnRole"],"properties":{"spawnRole":{"type":"string"}}},
           {"type":"object","required":["existingSessionId"],"properties":{"existingSessionId":{"type":"string"}}}
         ],
-        "description": "spawnRole 创建新 Session；existingSessionId 激活已有 Session，二者不可混用"
+        "description": "request 必须用 spawnRole；consult/notify 用 existingSessionId；escalate 省略 target"
       },
       "kind": {
         "type": "string",
         "enum": ["request", "consult", "notify", "escalate"],
-        "description": "request=完整委托可再派生; consult=询问不可再派生; notify=单向; escalate=上报Goal无法实现"
+        "description": "request=创建 Child Task 后执行; consult=仅创建 Invocation 且不可派生; notify=单向; escalate=上报当前 Goal 受阻"
       },
       "content": {
         "type": "string",
         "description": "消息内容"
       },
-      "evidenceArtifactIds": {
+      "evidenceClaimIds": {
         "type": "array",
         "items": { "type": "string" },
-        "description": "相关 Artifact ID 列表。kind=escalate 时必填且不能为空"
+        "description": "相关 EvidenceClaim/失败 Verification ID。kind=escalate 时必填且不能为空"
       },
       "budgetHint": {
         "type": "object",
         "description": "可选：建议给目标任务分配的预算。orchestrator 会验证是否超出父预算",
         "properties": {
           "tokens": { "type": "integer" },
-          "wallMs": { "type": "integer" },
+          "deadline": { "type": "string", "format": "date-time" },
           "usd": { "type": "number" }
         }
       }
@@ -79,23 +77,54 @@ Platform MCP 从 M2 启用。M2 注册 `hearth_dispatch_a2a`、`hearth_save_arti
 }
 ```
 
+MCP 工具 schema 的枚举值使用 lowercase wire spelling（例如 `request`、`checkpoint`）。Adapter 入站时必须
+将其显式归一化为核心领域的 uppercase enum（例如 `REQUEST`、`CHECKPOINT`）；REST 和数据库投影使用领域值，
+不得让大小写差异由各 Controller 自行猜测。
+
 副作用结果统一区分：`COMMITTED`、`COMMITTED_WITH_WARNING`、`REJECTED_BEFORE_COMMIT`、
 `UNKNOWN_COMMIT_STATE`。消息已持久化但实时广播失败时返回 `COMMITTED_WITH_WARNING`，重试同一
-`commandId` 返回原 messageId，不重复投递；`UNKNOWN_COMMIT_STATE` 进入 Inbox，不允许 agent 自动重试。
+内部 `commandId` 返回原 messageId，不重复投递；`UNKNOWN_COMMIT_STATE` 进入 Inbox，不允许 agent 自动重试。
+
+`existingSessionId` 不是任意 UUID：M2 application service 必须验证目标 Session 与调用方在同一 workspace，属于当前
+Task Tree 允许的祖先/当前/后代关系，使用允许的 workspace root，且状态允许接收该 kind。跨 workspace、跨 Task Tree、
+终止/不可接收 Session 均返回 `dispatch.target_not_authorized`；MCP schema 的 string 类型不能替代服务端授权。
+`artifactIds` 同样必须属于 source Task 或 PlanVersion 明确允许的 Evidence scope，不能通过猜测或泄露的 artifactId
+跨 Task 引用。
 
 **错误返回**（不会抛异常，以结构化错误返回让 agent 决定怎么处理）：
+
 ```json
 {
-  "error": "a2a.cycle_detected",
-  "ancestorChain": ["session-A", "session-B", "session-A"]
+  "error": "dispatch.target_not_authorized",
+  "message": "目标 Session 不属于当前 workspace/Task Tree 或当前状态不可接收"
 }
+```
+
+```json
 {
-  "error": "a2a.budget_exhausted",
-  "remaining": { "tokens": 0, "wallMs": 12000, "usd": 0.0 }
+  "error": "artifact.not_allowed_for_dispatch",
+  "message": "Artifact 不在当前 Dispatch 的 Evidence scope 内"
 }
+```
+
+```json
 {
-  "error": "a2a.escalate_requires_evidence",
-  "message": "kind=escalate 时 evidenceArtifactIds 不能为空"
+  "error": "dispatch.target_kind_invalid",
+  "message": "REQUEST requires spawnRole"
+}
+```
+
+```json
+{
+  "error": "dispatch.budget_exhausted",
+  "remaining": { "tokens": 0, "usd": 0.0, "deadline": "2026-08-13T18:00:00Z" }
+}
+```
+
+```json
+{
+  "error": "dispatch.escalate_requires_evidence",
+  "message": "kind=escalate 时 evidenceClaimIds 不能为空"
 }
 ```
 
@@ -104,7 +133,7 @@ Platform MCP 从 M2 启用。M2 注册 `hearth_dispatch_a2a`、`hearth_save_arti
 ### `hearth_save_artifact`
 
 保存产出物到中心 Artifact 存储，返回可跨 session 引用的 artifactId。
-这是 Evidence 的物质基础——没有 artifactId，断言不成立。
+Artifact 是 Evidence 的材料载体，但 artifactId 本身不证明任何断言；证明关系由 Claim/Verification 建立。
 
 ```json
 {
@@ -112,13 +141,8 @@ Platform MCP 从 M2 启用。M2 注册 `hearth_dispatch_a2a`、`hearth_save_arti
   "description": "保存产出物（代码变更、测试报告、文档等）并获得一个可被其他 agent 引用的 artifactId。",
   "inputSchema": {
     "type": "object",
-    "required": ["commandId", "type", "content"],
+    "required": ["type", "content"],
     "properties": {
-      "commandId": {
-        "type": "string",
-        "format": "uuid",
-        "description": "调用方生成的稳定幂等键；网络重试必须复用"
-      },
       "type": {
         "type": "string",
         "enum": ["code_change", "document", "test_result", "screenshot", "plan", "review", "command_output"],
@@ -152,53 +176,62 @@ Platform MCP 从 M2 启用。M2 注册 `hearth_dispatch_a2a`、`hearth_save_arti
 
 ---
 
-M2 首期不提供 path 参数，防止 agent 把 allowed workspace 之外的主机文件上传。内容小于 64 KiB 可存
-Postgres，64 KiB–1 MiB 写本地 Artifact storage。未来增加 path/大文件上传时，必须由 Worker 的受限
+M2 首期不提供 path 参数，防止 agent 把 allowed workspace 之外的主机文件上传。Artifact 创建时绑定当前
+Session 和 Task（M1 standalone 时 task 可空）；返回 artifactId 不授予跨 Task 读取权。其他 Session 只有在同一
+workspace 且当前 Task/PlanVersion 的 Evidence policy 明确允许时可见。未来增加 path/大文件上传时，必须由 Worker 的受限
 `ArtifactUploadRelay` 对 `session cwd + relative path` 做 real-path canonicalization、符号链接逃逸检查和
 文件大小上限；分块上传使用 uploadId、chunk hash、总 sha256 和幂等 finalize。
 
 ---
 
-### `hearth_checkpoint_done`
+### `hearth_submit_claim`
 
-上报一个 Checkpoint 已完成，并提交 Evidence Artifact。
-编排层收到后**独立验证** Artifact 内容，不相信 agent 的文字结论。
+为 Checkpoint/Goal/Operation 上报具体 Execution Claim，并关联 Artifact 材料。编排层按 PlanVersion 中的
+verifier policy 调度 deterministic tool、独立 reviewer Session 或 human verifier。
 
 ```json
 {
-  "name": "hearth_checkpoint_done",
-  "description": "上报 checkpoint 完成。必须提供 Evidence Artifact ID，编排层会独立验证，不接受文字断言。",
+  "name": "hearth_submit_claim",
+  "description": "提交一个可验证断言及其材料；Artifact 本身不代表断言已通过。",
   "inputSchema": {
     "type": "object",
-    "required": ["commandId", "checkpointId", "artifactId"],
+    "required": ["subjectType", "subjectRef", "statement", "artifactIds", "sourceStateRef"],
     "properties": {
-      "commandId": {
+      "subjectType": {
         "type": "string",
-        "format": "uuid",
-        "description": "稳定幂等键；重复提交返回原 checkpoint execution"
+        "enum": ["checkpoint", "goal", "artifact", "operation"]
       },
-      "checkpointId": {
-        "type": "string",
-        "description": "Task.checkpoints 里定义的 checkpoint ID"
+      "subjectRef": { "type": "string" },
+      "statement": { "type": "string" },
+      "artifactIds": {
+        "type": "array",
+        "minItems": 1,
+        "items": { "type": "string" },
+        "description": "支撑材料 Artifact ID；不自动等于验证通过"
       },
-      "artifactId": {
-        "type": "string",
-        "description": "证明 checkpoint 完成的 Artifact ID（如测试报告、代码 diff）"
+      "sourceStateRef": {
+        "type": "object",
+        "description": "workspaceRootId/relativeCwd、git tree 或 base+diff SHA、命令和工具版本"
       },
       "notes": {
         "type": "string",
-        "description": "可选：补充说明（编排层验证失败时会用到）"
+        "description": "可选补充，不作为验证结论"
       }
     }
   }
 }
 ```
 
+`hearth_submit_claim` 的每个 Artifact 必须对当前 Session 可见，并属于当前 Task 或 PlanVersion 明确允许的 Evidence
+scope；服务端在同一事务锁定/检查 Artifact scope 后才创建 Claim。任意泄露或猜测的跨 Task ID 返回
+`artifact.not_visible_to_session` 或 `claim.artifact_scope_mismatch`，不能仅因 Artifact 存在就建立证明关系。
+
 **返回**：
 ```json
-{ "status": "verifying" }
+{ "claimId": "claim-uuid", "status": "PENDING_VERIFICATION" }
 ```
-验证结果通过 A2A notify 异步推送，不同步等待（避免阻塞 agent）。
+验证结果通过 Internal Dispatch notify 异步推送，不同步等待。语义 checkpoint 由 reviewer Session 产出
+Review Artifact 后写 VerificationRecord，不能假装由 orchestrator deterministic verify。
 
 ---
 
@@ -255,13 +288,13 @@ Postgres，64 KiB–1 MiB 写本地 Artifact storage。未来增加 path/大文�
 
 ### `hearth_get_task_context`
 
-获取当前任务的 Goal、Context、Checkpoint 列表。agent 启动时应该主动调用，
-确保理解任务目标，不靠 system prompt 里的文字记忆。
+获取当前任务固定引用的 `TaskSpecVersion`、`PlanVersion`、预算和截止时间。agent 启动时应该主动调用，
+确保理解当前冻结的任务目标和计划，不靠 system prompt 里的文字记忆。
 
 ```json
 {
   "name": "hearth_get_task_context",
-  "description": "获取当前任务的完整 G4C+E 上下文（Goal、已知 Context、Checkpoint 列表）。",
+  "description": "获取当前执行固定引用的 TaskSpecVersion、PlanVersion 与预算/截止时间。",
   "inputSchema": {
     "type": "object",
     "properties": {}
@@ -273,17 +306,20 @@ Postgres，64 KiB–1 MiB 写本地 Artifact storage。未来增加 path/大文�
 ```json
 {
   "taskId": "task-001",
+  "specVersionId": "spec-uuid",
+  "planVersionId": "plan-uuid",
   "goal": "POST /auth/login 返回 200，mvn test 退出码为 0，grep -r plaintext_password src/ 无输出",
   "context": {
     "known": [
-      { "fact": "项目使用 PostgreSQL 16", "source": "file:pom.xml:42" }
+      { "id": "ctx-1", "kind": "FACT", "statement": "项目使用 PostgreSQL 16", "sourceRefs": ["file:pom.xml:42"] }
     ],
     "gaps": ["JWT 过期时间尚未确定，需要向 architect 咨询"]
   },
   "checkpoints": [
     { "id": "cp-001", "after": "核心逻辑实现", "verify": "mvn test -pl hearth-gateway" }
   ],
-  "budgetRemaining": { "tokens": 145000, "wallMs": 2700000, "usd": 1.24 }
+  "budgetRemaining": { "tokens": 145000, "usd": 1.24 },
+  "deadline": "2026-08-13T18:00:00Z"
 }
 ```
 
@@ -323,8 +359,8 @@ URL 包含 sessionId，服务端据此确定 TraceContext、预算账本、任�
 
 1. 每次启动时调用 hearth_get_task_context 获取完整任务目标
 2. 产出任何具体成果后立刻调用 hearth_save_artifact，不要等到最后再保存
-3. 完成 checkpoint 时必须先 save_artifact，再用 artifactId 调用 hearth_checkpoint_done
-4. 需要其他 agent 协作时通过 hearth_dispatch_a2a，不要在输出中直接 @mention
-5. 发现 Goal 无法实现时立刻调用 hearth_dispatch_a2a(kind=escalate)，不要假装可以做到
+3. 声称 checkpoint/Goal 完成时，先保存 Artifact，再用 hearth_submit_claim 提交具体断言和 sourceStateRef
+4. 需要其他 agent 协作时通过 hearth_dispatch；request 会创建 Child Task，consult 只创建 Invocation
+5. 发现 Goal 无法实现时先提交可核验的失败 Claim，再调用 hearth_dispatch(kind=escalate)
 6. 检索记忆时用 hearth_retrieve_memory，把返回的 memoryId 记录在 context.known 来源里
 ```
