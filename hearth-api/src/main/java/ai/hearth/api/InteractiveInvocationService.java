@@ -16,17 +16,20 @@ final class InteractiveInvocationService {
     private final AnthropicUpstreamClient upstream;
 
     private final JdbcInvocationRepository invocations;
+    private final InvocationEventHub eventHub;
     private final JsonMapper jsonMapper = JsonMapper.builder().build();
 
     InteractiveInvocationService(
             SessionRepository sessions,
             InteractiveSessionService sessionService,
             AnthropicUpstreamClient upstream,
-            JdbcInvocationRepository invocations) {
+            JdbcInvocationRepository invocations,
+            InvocationEventHub eventHub) {
         this.sessions = sessions;
         this.sessionService = sessionService;
         this.upstream = upstream;
         this.invocations = invocations;
+        this.eventHub = eventHub;
     }
 
     String invoke(UUID sessionId, String content, UUID commandId) {
@@ -34,6 +37,7 @@ final class InteractiveInvocationService {
         var invocationId = UUID.randomUUID();
         invocations.create(sessionId, invocationId, commandId, content);
         invocations.markRunning(invocationId);
+        eventHub.publish(new InvocationEvent(invocationId, sessionId, "RUNNING", null));
         sessionService.appendUserTurn(sessionId, content);
         try {
             var request = new LinkedHashMap<String, Object>();
@@ -50,10 +54,12 @@ final class InteractiveInvocationService {
                 var assistant = extractAssistantText(input.readAllBytes());
                 sessionService.appendAssistantTurn(sessionId, assistant);
                 invocations.complete(invocationId, assistant);
+                eventHub.publish(new InvocationEvent(invocationId, sessionId, "SEMANTIC_COMPLETED", assistant));
                 return assistant;
             }
         } catch (IOException | InterruptedException exception) {
             invocations.fail(invocationId, "transport_failed");
+            eventHub.publish(new InvocationEvent(invocationId, sessionId, "FAILED", null));
             if (exception instanceof InterruptedException) {
                 Thread.currentThread().interrupt();
             }
