@@ -14,17 +14,26 @@ final class InteractiveInvocationService {
     private final SessionRepository sessions;
     private final InteractiveSessionService sessionService;
     private final AnthropicUpstreamClient upstream;
+
+    private final JdbcInvocationRepository invocations;
     private final JsonMapper jsonMapper = JsonMapper.builder().build();
 
     InteractiveInvocationService(
-            SessionRepository sessions, InteractiveSessionService sessionService, AnthropicUpstreamClient upstream) {
+            SessionRepository sessions,
+            InteractiveSessionService sessionService,
+            AnthropicUpstreamClient upstream,
+            JdbcInvocationRepository invocations) {
         this.sessions = sessions;
         this.sessionService = sessionService;
         this.upstream = upstream;
+        this.invocations = invocations;
     }
 
-    String invoke(UUID sessionId, String content) {
+    String invoke(UUID sessionId, String content, UUID commandId) {
         var session = sessions.findById(sessionId).orElseThrow(() -> new GatewayRequestException("session.not_found"));
+        var invocationId = UUID.randomUUID();
+        invocations.create(sessionId, invocationId, commandId, content);
+        invocations.markRunning(invocationId);
         sessionService.appendUserTurn(sessionId, content);
         try {
             var request = new LinkedHashMap<String, Object>();
@@ -40,9 +49,11 @@ final class InteractiveInvocationService {
                 }
                 var assistant = extractAssistantText(input.readAllBytes());
                 sessionService.appendAssistantTurn(sessionId, assistant);
+                invocations.complete(invocationId, assistant);
                 return assistant;
             }
         } catch (IOException | InterruptedException exception) {
+            invocations.fail(invocationId, "transport_failed");
             if (exception instanceof InterruptedException) {
                 Thread.currentThread().interrupt();
             }

@@ -39,7 +39,7 @@ final class InteractiveSessionController {
             @PathVariable("sessionId") UUID sessionId,
             @RequestHeader(value = "Authorization", defaultValue = "") String authorization,
             @RequestBody InvokeRequest request) {
-        var response = invocationService.invoke(sessionId, request.content());
+        var response = invocationService.invoke(sessionId, request.content(), request.commandId());
         return ResponseEntity.ok(success(Map.of(
                 "sessionId", sessionId,
                 "commandId", request.commandId() == null ? UUID.randomUUID() : request.commandId(),

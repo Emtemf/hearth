@@ -17,16 +17,18 @@ import org.springframework.web.bind.annotation.RestController;
 @ConditionalOnProperty(name = "hearth.persistence.enabled", havingValue = "true")
 final class InvocationController {
     private final InteractiveInvocationService invocationService;
+    private final JdbcInvocationRepository invocations;
 
-    InvocationController(InteractiveInvocationService invocationService) {
+    InvocationController(InteractiveInvocationService invocationService, JdbcInvocationRepository invocations) {
         this.invocationService = invocationService;
+        this.invocations = invocations;
     }
 
     @PostMapping("/{sessionId}/invocations")
     ResponseEntity<Map<String, Object>> invoke(
             @PathVariable("sessionId") UUID sessionId,
             @RequestBody InvokeRequest request) {
-        var assistant = invocationService.invoke(sessionId, request.content());
+        var assistant = invocationService.invoke(sessionId, request.content(), request.commandId());
         var response = new LinkedHashMap<String, Object>();
         response.put("data", Map.of(
                 "sessionId", sessionId,
@@ -39,6 +41,6 @@ final class InvocationController {
 
     @GetMapping("/{sessionId}/invocations")
     Map<String, Object> list(@PathVariable("sessionId") UUID sessionId) {
-        return Map.of("data", Map.of("sessionId", sessionId, "content", java.util.List.of()), "error", (Object) null);
+        return Map.of("data", Map.of("sessionId", sessionId, "content", invocations.findBySession(sessionId)), "error", (Object) null);
     }
 }
