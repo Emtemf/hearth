@@ -43,7 +43,7 @@ migration 演进，不预建未来表。
 
 | Slice | 可独立验证的出口 |
 |---|---|
-| M1.0 接入 spike | Claude Code 经最小受控代理完成真实流式请求，认证头替换与 base URL 行为有 fixture/抓包证据；并实测 stream-json result 后能否接收第二条 stdin，确定 ProcessReusePolicy；spike 不直接演化成生产 Controller |
+| M1.0 接入 spike | 先用独立、可重复的 subprocess fixture harness 固定 Claude Code stdio command shape、NDJSON parser、受控 child environment 和 result 后第二条 stdin 的协议；再由显式 opt-in real CLI probe 验证锁定版本的 `ProcessReusePolicy`。fixture 不等于真实 CLI/Gateway 验收，spike 不直接演化成生产 Controller |
 | M1.1 数据面 | 有界请求读取、响应 streaming、Exchange 录制/partial、token usage 和协议 contract test 通过 |
 | M1.2 运行面 | bootstrap → standalone Session → 本机 `hearth-worker`/Process generation → 两次单活 Invocation → 中心重启 reconcile；不同 UID、权限和本机 transport 验收 |
 | M1.3 产品面 | 管理认证/CSRF、REST transcript、publication SSE/snapshot 收敛、最小 UI 和性能验收通过 |

@@ -178,7 +178,9 @@ Gateway。
 
 Adapter 同时声明 `ProcessReusePolicy`：`STREAMING_STDIN` 表示 result 后可继续向同代进程写下一条 Invocation；
 `RESUME_PER_INVOCATION` 表示每次 Invocation 使用新 process generation，并由 Adapter 生成/验证
-ResumeDescriptor。调用方只依赖策略，不得因一次 CLI 实测可复用就把所有 Adapter 写死为长驻。
+ResumeDescriptor。调用方只依赖策略，不得因一次 CLI 实测可复用就把所有 Adapter 写死为长驻。M1.0 先用受控
+fixture harness 验证 parser、环境收敛和双输入协议；只有显式 opt-in 的真实 CLI probe 在锁定版本通过后，才能把
+Claude Code 的实际策略及其 stdout evidence 固定为兼容基线。
 
 ---
 
