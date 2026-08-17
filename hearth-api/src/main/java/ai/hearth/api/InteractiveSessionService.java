@@ -5,6 +5,7 @@ import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.UUID;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
@@ -14,9 +15,16 @@ import org.springframework.stereotype.Service;
 final class InteractiveSessionService {
     private final JdbcTemplate jdbcTemplate;
     private final SecureRandom random = new SecureRandom();
+    private final String defaultUpstreamBaseUrl;
+    private final String defaultModel;
 
-    InteractiveSessionService(JdbcTemplate jdbcTemplate) {
+    InteractiveSessionService(
+            JdbcTemplate jdbcTemplate,
+            @Value("${hearth.gateway.anthropic.upstream-base-url:http://127.0.0.1:4599}") String defaultUpstreamBaseUrl,
+            @Value("${hearth.gateway.default-model:claude-opus-5}") String defaultModel) {
         this.jdbcTemplate = jdbcTemplate;
+        this.defaultUpstreamBaseUrl = defaultUpstreamBaseUrl;
+        this.defaultModel = defaultModel;
     }
 
     InteractiveSession create(CreateSessionRequest request) {
@@ -28,9 +36,9 @@ final class InteractiveSessionService {
                      latest_system_prompt, recording_status)
                 VALUES (?, ?, 'READY', 'full', ?, ?, 'complete')
                 """, sessionId, valueOrDefault(request.agentRole(), "coder"),
-                valueOrDefault(request.model(), "claude-opus-5"),
+                valueOrDefault(request.model(), defaultModel),
                 valueOrDefault(request.systemPrompt(), "You are the Hearth coding agent."));
-        return new InteractiveSession(sessionId, capability);
+        return new InteractiveSession(sessionId, capability, defaultUpstreamBaseUrl, valueOrDefault(request.model(), defaultModel));
     }
 
     void appendUserTurn(UUID sessionId, String content) {

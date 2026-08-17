@@ -30,6 +30,7 @@ final class InteractiveSessionController {
         return success(Map.of(
                 "id", session.id(),
                 "gatewayBaseUrl", "/s/" + session.id() + "/anthropic",
+                "effectiveModel", session.effectiveModel(),
                 "gatewayCapability", session.gatewayCapability()));
     }
 

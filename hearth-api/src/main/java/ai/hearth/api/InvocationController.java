@@ -1,5 +1,6 @@
 package ai.hearth.api;
 
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.UUID;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
@@ -26,13 +27,14 @@ final class InvocationController {
             @PathVariable("sessionId") UUID sessionId,
             @RequestBody InvokeRequest request) {
         var assistant = invocationService.invoke(sessionId, request.content());
-        return ResponseEntity.ok(Map.of(
-                "data", Map.of(
-                        "sessionId", sessionId,
-                        "commandId", request.commandId() == null ? UUID.randomUUID() : request.commandId(),
-                        "status", "semantic_completed",
-                        "assistantContent", assistant),
-                "error", (Object) null));
+        var response = new LinkedHashMap<String, Object>();
+        response.put("data", Map.of(
+                "sessionId", sessionId,
+                "commandId", request.commandId() == null ? UUID.randomUUID() : request.commandId(),
+                "status", "semantic_completed",
+                "assistantContent", assistant));
+        response.put("error", null);
+        return ResponseEntity.ok(response);
     }
 
     @GetMapping("/{sessionId}/invocations")
