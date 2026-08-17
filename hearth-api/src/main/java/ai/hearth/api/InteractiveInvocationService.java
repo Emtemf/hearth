@@ -13,8 +13,7 @@ import org.springframework.stereotype.Service;
 final class InteractiveInvocationService {
     private final SessionRepository sessions;
     private final InteractiveSessionService sessionService;
-    private final AnthropicUpstreamClient upstream;
-
+    private final ApiWorkerClient workerClient;
     private final JdbcInvocationRepository invocations;
     private final InvocationEventHub eventHub;
     private final JsonMapper jsonMapper = JsonMapper.builder().build();
@@ -22,12 +21,12 @@ final class InteractiveInvocationService {
     InteractiveInvocationService(
             SessionRepository sessions,
             InteractiveSessionService sessionService,
-            AnthropicUpstreamClient upstream,
+            ApiWorkerClient workerClient,
             JdbcInvocationRepository invocations,
             InvocationEventHub eventHub) {
         this.sessions = sessions;
         this.sessionService = sessionService;
-        this.upstream = upstream;
+        this.workerClient = workerClient;
         this.invocations = invocations;
         this.eventHub = eventHub;
     }
@@ -40,30 +39,21 @@ final class InteractiveInvocationService {
         eventHub.publish(new InvocationEvent(invocationId, sessionId, "RUNNING", null));
         sessionService.appendUserTurn(sessionId, content);
         try {
-            var request = new LinkedHashMap<String, Object>();
-            request.put("model", session.effectiveModel());
-            request.put("system", session.latestSystemPrompt());
-            request.put("stream", true);
-            request.put("messages", java.util.List.of(java.util.Map.of("role", "user", "content", content)));
-            var body = jsonMapper.writeValueAsBytes(request);
-            var response = upstream.forward(body, "2023-06-01");
-            try (var input = response.body()) {
-                if (response.statusCode() / 100 != 2) {
-                    throw new GatewayRequestException("gateway.upstream_rejected_request");
-                }
-                var assistant = extractAssistantText(input.readAllBytes());
-                sessionService.appendAssistantTurn(sessionId, assistant);
-                invocations.complete(invocationId, assistant);
-                eventHub.publish(new InvocationEvent(invocationId, sessionId, "SEMANTIC_COMPLETED", assistant));
-                return assistant;
+            var workerResult = workerClient.invoke(sessionId, invocationId, content, session.effectiveModel(), session.latestSystemPrompt());
+            if (workerResult.assistantContent().isBlank()) {
+                invocations.fail(invocationId, workerResult.transportStatus());
+                eventHub.publish(new InvocationEvent(invocationId, sessionId, "FAILED", null));
+                throw new GatewayRequestException("gateway.invocation_failed");
             }
-        } catch (IOException | InterruptedException exception) {
-            invocations.fail(invocationId, "transport_failed");
+            var assistant = workerResult.assistantContent();
+            sessionService.appendAssistantTurn(sessionId, assistant);
+            invocations.complete(invocationId, assistant);
+            eventHub.publish(new InvocationEvent(invocationId, sessionId, "SEMANTIC_COMPLETED", assistant));
+            return assistant;
+        } catch (RuntimeException exception) {
+            invocations.fail(invocationId, "worker_failed");
             eventHub.publish(new InvocationEvent(invocationId, sessionId, "FAILED", null));
-            if (exception instanceof InterruptedException) {
-                Thread.currentThread().interrupt();
-            }
-            throw new GatewayRequestException("gateway.invocation_failed");
+            throw exception;
         }
     }
 
