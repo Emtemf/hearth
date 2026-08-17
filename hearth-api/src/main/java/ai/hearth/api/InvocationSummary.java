@@ -6,6 +6,7 @@ import java.util.UUID;
 record InvocationSummary(
         UUID id,
         UUID commandId,
+        UUID sessionId,
         String status,
         String content,
         String assistantContent,

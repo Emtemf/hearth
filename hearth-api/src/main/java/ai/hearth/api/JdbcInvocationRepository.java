@@ -52,6 +52,7 @@ final class JdbcInvocationRepository {
                 """, (rs, rowNum) -> new InvocationSummary(
                 rs.getObject("id", UUID.class),
                 rs.getObject("command_id", UUID.class),
+                rs.getObject("session_id", UUID.class),
                 rs.getString("status"),
                 rs.getString("content"),
                 rs.getString("assistant_content"),
@@ -64,7 +65,8 @@ final class JdbcInvocationRepository {
                 SELECT id, command_id, status, content, assistant_content, created_at, semantic_completed_at
                 FROM hearth_invocation WHERE id = ?
                 """, (rs, rowNum) -> new InvocationSummary(
-                rs.getObject("id", UUID.class), rs.getObject("command_id", UUID.class), rs.getString("status"),
+                rs.getObject("id", UUID.class), rs.getObject("command_id", UUID.class),
+                rs.getObject("session_id", UUID.class), rs.getString("status"),
                 rs.getString("content"), rs.getString("assistant_content"),
                 rs.getObject("created_at", OffsetDateTime.class).toInstant(),
                 rs.getObject("semantic_completed_at", OffsetDateTime.class) == null ? null : rs.getObject("semantic_completed_at", OffsetDateTime.class).toInstant()), invocationId);
