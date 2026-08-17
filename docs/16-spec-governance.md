@@ -41,6 +41,14 @@ AGENTS、CLAUDE 和 `.claude/rules` 是入口/摘要，不得成为第二套详�
 提交文档变更前至少运行：
 
 ```bash
+python3 scripts/validate_docs.py
+git diff --check
+```
+
+`validate_docs.py` 检查本地 Markdown 相对链接、标记为 `json` 的单文档示例、credential-like 值，并执行
+以下 drift check：
+
+```bash
 rg -n --glob '!16-spec-governance.md' \
   "hearth_dispatch_a2a|hearth_checkpoint_done|完整 V001|六个模块|M1.*MCP server|Pi.*不使用自身 Provider|Pi.*工具调用.*权限检查" \
   AGENTS.md CLAUDE.md README.md docs .claude
