@@ -75,7 +75,8 @@
     if (!content) return;
     send.disabled = true;
     try {
-      await fetch(`/api/v1/sessions/${id}/messages`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ content }) });
+      const response = await fetch(`/api/v1/sessions/${id}/messages`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ content, commandId: crypto.randomUUID() }) });
+      if (!response.ok) throw new Error(`Invocation failed: ${response.status}`);
       await show(id);
     } finally { send.disabled = false; }
   }

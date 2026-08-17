@@ -17,9 +17,11 @@ import org.springframework.web.bind.annotation.RestController;
 @ConditionalOnProperty(name = "hearth.persistence.enabled", havingValue = "true")
 final class InteractiveSessionController {
     private final InteractiveSessionService service;
+    private final InteractiveInvocationService invocationService;
 
-    InteractiveSessionController(InteractiveSessionService service) {
+    InteractiveSessionController(InteractiveSessionService service, InteractiveInvocationService invocationService) {
         this.service = service;
+        this.invocationService = invocationService;
     }
 
     @PostMapping
@@ -36,8 +38,12 @@ final class InteractiveSessionController {
             @PathVariable("sessionId") UUID sessionId,
             @RequestHeader(value = "Authorization", defaultValue = "") String authorization,
             @RequestBody InvokeRequest request) {
-        service.appendUserTurn(sessionId, request.content());
-        return ResponseEntity.accepted().body(success(Map.of("sessionId", sessionId, "status", "accepted")));
+        var response = invocationService.invoke(sessionId, request.content());
+        return ResponseEntity.ok(success(Map.of(
+                "sessionId", sessionId,
+                "commandId", request.commandId() == null ? UUID.randomUUID() : request.commandId(),
+                "status", "semantic_completed",
+                "assistantContent", response)));
     }
 
     private Map<String, Object> success(Object data) {

@@ -37,6 +37,10 @@ final class InteractiveSessionService {
         appendTurn(sessionId, "user", content);
     }
 
+    void appendAssistantTurn(UUID sessionId, String content) {
+        appendTurn(sessionId, "assistant", content);
+    }
+
     private void appendTurn(UUID sessionId, String role, String content) {
         Integer ordinal = jdbcTemplate.queryForObject(
                 "SELECT COALESCE(MAX(ordinal), 0) + 1 FROM hearth_transcript_turn WHERE session_id = ?",
