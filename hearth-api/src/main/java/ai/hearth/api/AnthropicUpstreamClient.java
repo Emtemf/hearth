@@ -17,7 +17,7 @@ final class AnthropicUpstreamClient {
 
     AnthropicUpstreamClient(
             @Value("${hearth.gateway.anthropic.upstream-base-url:http://127.0.0.1:4599}") String upstreamBaseUrl,
-            @Value("${ANTHROPIC_API_KEY:}") String apiKey) {
+            @Value("${hearth.gateway.anthropic.api-key:${ANTHROPIC_API_KEY:}}") String apiKey) {
         this.httpClient = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build();
         this.upstreamBaseUri = URI.create(upstreamBaseUrl);
         this.apiKey = apiKey;

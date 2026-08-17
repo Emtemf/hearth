@@ -1,5 +1,6 @@
 package ai.hearth.api;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.util.UUID;
 import org.springframework.beans.factory.annotation.Value;
@@ -46,11 +47,19 @@ final class AnthropicGatewayController {
         var upstream = upstreamClient.forward(requestBody, anthropicVersion);
         var responseBody = (StreamingResponseBody) outputStream -> {
             try (var input = upstream.body()) {
-                var captured = input.readAllBytes();
-                outputStream.write(captured);
-                outputStream.flush();
+                var capture = new ByteArrayOutputStream();
+                var buffer = new byte[8192];
+                int read;
+                while ((read = input.read(buffer)) >= 0) {
+                    if (read == 0) {
+                        continue;
+                    }
+                    outputStream.write(buffer, 0, read);
+                    outputStream.flush();
+                    capture.write(buffer, 0, read);
+                }
                 if (exchange != null) {
-                    exchangeRecorder.complete(exchange, captured, upstream.statusCode(), true);
+                    exchangeRecorder.complete(exchange, capture.toByteArray(), upstream.statusCode(), true);
                 }
             } catch (IOException exception) {
                 if (exchange != null) {
