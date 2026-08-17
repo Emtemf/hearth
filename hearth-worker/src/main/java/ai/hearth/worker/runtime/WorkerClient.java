@@ -11,6 +11,8 @@ public interface WorkerClient {
     WorkerCommandResult cancel(CancelCommand command);
 }
 
+record InvocationCommandIdentity(UUID invocationId, ProcessIdentity process) {}
+
 record ProcessIdentity(UUID sessionId, long processGeneration, UUID launchId) {}
 
 record LaunchCommand(UUID commandId, ProcessIdentity process, Path executable, Path workingDirectory) {}
