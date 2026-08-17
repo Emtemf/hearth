@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Hearth M1</title>
+  <style>
+    :root { color-scheme: light; font-family: Inter, ui-sans-serif, system-ui, sans-serif; background: #f3f5f7; color: #17212b; }
+    body { margin: 0; }
+    header { background: #17212b; color: white; padding: 20px 28px; display: flex; justify-content: space-between; align-items: baseline; }
+    header h1 { margin: 0; font-size: 22px; letter-spacing: .02em; }
+    header span { color: #a8bac8; font-size: 13px; }
+    main { display: grid; grid-template-columns: 300px minmax(0, 1fr); min-height: calc(100vh - 68px); }
+    aside { border-right: 1px solid #d9e0e5; background: white; padding: 20px; }
+    section { padding: 24px clamp(20px, 4vw, 52px); max-width: 1100px; }
+    .eyebrow { color: #657786; font-size: 12px; text-transform: uppercase; letter-spacing: .12em; }
+    .session { border: 1px solid #d9e0e5; border-radius: 6px; padding: 14px; margin-top: 14px; cursor: pointer; background: #fff; }
+    .session.active { border-color: #247ba0; box-shadow: 0 0 0 2px #d8edf5; }
+    .session strong { display: block; margin: 5px 0 8px; }
+    .muted { color: #657786; font-size: 13px; }
+    .grid { display: grid; grid-template-columns: repeat(4, minmax(120px, 1fr)); gap: 12px; margin: 22px 0; }
+    .metric { background: white; border: 1px solid #d9e0e5; border-radius: 6px; padding: 14px; }
+    .metric b { display: block; font-size: 20px; margin-top: 6px; }
+    .panel { background: white; border: 1px solid #d9e0e5; border-radius: 6px; padding: 20px; margin-top: 16px; }
+    .panel h2 { margin: 0 0 14px; font-size: 16px; }
+    pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #f6f8fa; padding: 14px; border-radius: 4px; line-height: 1.5; }
+    .turn { border-left: 3px solid #9bb7c6; padding: 4px 0 4px 14px; margin: 13px 0; }
+    .turn b { display: block; font-size: 12px; text-transform: uppercase; color: #657786; margin-bottom: 4px; }
+    .status { color: #287d3c; font-weight: 650; }
+    .composer { display: flex; gap: 10px; margin-top: 18px; }
+    textarea { flex: 1; min-height: 90px; border: 1px solid #c8d2d9; border-radius: 5px; padding: 12px; font: inherit; resize: vertical; }
+    button { border: 0; border-radius: 5px; background: #247ba0; color: white; padding: 0 18px; font: inherit; cursor: pointer; }
+    button:disabled { opacity: .5; cursor: not-allowed; }
+    .notice { color: #9a5b00; background: #fff5dd; border: 1px solid #efd28c; padding: 12px; border-radius: 5px; margin-top: 14px; }
+    @media (max-width: 760px) { main { grid-template-columns: 1fr; } aside { border-right: 0; border-bottom: 1px solid #d9e0e5; } .grid { grid-template-columns: repeat(2, 1fr); } }
+  </style>
+</head>
+<body>
+<header><h1>Hearth / M1</h1><span id="health">checking health...</span></header>
+<main>
+  <aside><div class="eyebrow">Sessions</div><button id="new-session" type="button" style="height:36px;margin-top:12px">New session</button><div id="sessions">Loading...</div></aside>
+  <section id="detail"><div class="muted">Choose a session.</div></section>
+</main>
+<script>
+  const sessionsEl = document.getElementById('sessions');
+  const detailEl = document.getElementById('detail');
+  const healthEl = document.getElementById('health');
+  const json = (url) => fetch(url).then((r) => { if (!r.ok) throw new Error(r.status); return r.json(); });
+  let sessions = [];
+  async function load() {
+    try {
+      const health = await json('/actuator/health');
+      healthEl.textContent = `gateway ${health.status}`;
+      const list = await json('/api/v1/sessions');
+      sessions = list.data.content;
+      sessionsEl.innerHTML = sessions.map((s, i) => `<div class="session ${i === 0 ? 'active' : ''}" data-id="${s.id}"><span class="muted">${s.status}</span><strong>${s.agentRole} · ${s.effectiveModel}</strong><span class="muted">${s.inputTokens} in / ${s.outputTokens} out</span></div>`).join('');
+      sessionsEl.querySelectorAll('.session').forEach((node) => node.addEventListener('click', () => { sessionsEl.querySelectorAll('.session').forEach((n) => n.classList.remove('active')); node.classList.add('active'); show(node.dataset.id); }));
+      if (sessions.length) show(sessions[0].id);
+    } catch (error) { healthEl.textContent = 'offline'; sessionsEl.textContent = 'Unable to load sessions'; }
+  }
+  async function show(id) {
+    const [session, transcript, exchanges] = await Promise.all([
+      json(`/api/v1/sessions/${id}`), json(`/api/v1/sessions/${id}/transcript`), json(`/api/v1/sessions/${id}/exchanges`)
+    ]);
+    const d = session.data;
+    const turns = transcript.data.turns.map((t) => `<div class="turn"><b>${t.role}</b><div>${escapeHtml(t.content)}</div></div>`).join('');
+    const totals = exchanges.data.content.reduce((a, e) => ({ input: a.input + e.inputTokens, output: a.output + e.outputTokens }), { input: 0, output: 0 });
+    detailEl.innerHTML = `<div class="eyebrow">Session detail</div><h2>${d.agentRole} · ${d.effectiveModel}</h2><div class="muted">${d.id}</div><div class="grid"><div class="metric"><span class="muted">State</span><b class="status">${d.status}</b></div><div class="metric"><span class="muted">Input tokens</span><b>${totals.input}</b></div><div class="metric"><span class="muted">Output tokens</span><b>${totals.output}</b></div><div class="metric"><span class="muted">Recording</span><b>${d.latestSystemPromptRecordingStatus}</b></div></div><div class="panel"><h2>Latest system prompt</h2><pre>${escapeHtml(d.latestSystemPrompt)}</pre></div><div class="panel"><h2>Transcript</h2>${turns}</div><div class="panel"><h2>Exchanges</h2><div class="muted">${exchanges.data.content.length} model exchange(s), all recording gaps: none</div></div><div class="panel"><h2>Send a message</h2><div class="notice">This composer stores your user turn now. A real Worker invocation will be connected in the next runtime slice.</div><div class="composer"><textarea id="composer" placeholder="Ask the agent something..."></textarea><button id="send" type="button">Send</button></div></div>`;
+    document.getElementById('send').addEventListener('click', () => sendMessage(id));
+  }
+  async function sendMessage(id) {
+    const composer = document.getElementById('composer');
+    const send = document.getElementById('send');
+    const content = composer.value.trim();
+    if (!content) return;
+    send.disabled = true;
+    try {
+      await fetch(`/api/v1/sessions/${id}/messages`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ content }) });
+      await show(id);
+    } finally { send.disabled = false; }
+  }
+  document.getElementById('new-session').addEventListener('click', async () => {
+    const response = await fetch('/api/v1/sessions', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ agentRole: 'coder', model: 'claude-opus-5', systemPrompt: 'You are the Hearth coding agent.' }) });
+    if (response.ok) await load();
+  });
+  function escapeHtml(value) { return String(value).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
+  load();
+</script>
+</body>
+</html>
