@@ -1,14 +1,15 @@
 import { useState } from 'react'
-import type { Exchange, SessionDetail, Transcript } from '../../lib/api'
+import type { Exchange, InvocationSummary, SessionDetail, Transcript } from '../../lib/api'
 import { useInvoke } from './mutations'
 
 interface SessionWorkspaceProps {
   detail: SessionDetail
   transcript: Transcript
   exchanges: Exchange[]
+  invocations: InvocationSummary[]
 }
 
-export function SessionWorkspace({ detail, transcript, exchanges }: SessionWorkspaceProps) {
+export function SessionWorkspace({ detail, transcript, exchanges, invocations }: SessionWorkspaceProps) {
   const [content, setContent] = useState('')
   const invoke = useInvoke(detail.id)
   const input = exchanges.reduce((sum, item) => sum + item.inputTokens, 0)
@@ -19,6 +20,7 @@ export function SessionWorkspace({ detail, transcript, exchanges }: SessionWorks
     <div className="metrics"><Metric label="Input tokens" value={input.toLocaleString()} /><Metric label="Output tokens" value={output.toLocaleString()} /><Metric label="Exchanges" value={exchanges.length.toString()} /><Metric label="Recording" value={detail.latestSystemPromptRecordingStatus} /></div>
     <section className="panel transcript-panel"><div className="panel-title"><span>Conversation trace</span><span className="panel-meta">{transcript.turns.length} turns</span></div><div className="turns">{transcript.turns.map((turn, index) => <article className={`turn turn-${turn.role}`} key={`${turn.createdAt}-${index}`}><div className="turn-meta"><span>{turn.role.replace('_', ' ')}</span><time>{new Date(turn.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</time></div><p>{turn.content}</p></article>)}</div><div className="composer"><textarea value={content} onChange={(event) => setContent(event.target.value)} placeholder="Send an invocation to this session…" onKeyDown={(event) => { if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) submit() }} /><button onClick={submit} disabled={invoke.isPending || !content.trim()}>{invoke.isPending ? 'Running…' : 'Run invocation'}</button></div></section>
     <section className="panel prompt-panel"><div className="panel-title"><span>System prompt / evidence</span><span className="badge">{detail.observabilityLevel}</span></div><pre>{detail.latestSystemPrompt}</pre></section>
+    <section className="panel prompt-panel"><div className="panel-title"><span>Invocation ledger</span><span className="panel-meta">{invocations.length} runs</span></div><div className="invocations">{invocations.length === 0 ? <p className="empty-inline">No invocation records yet.</p> : invocations.map((item) => <div className="invocation" key={item.id}><span className={`invocation-dot ${item.status.toLowerCase()}`} /><div><strong>{item.status}</strong><small>{item.commandId}</small><p>{item.content}</p></div></div>)}</div></section>
   </div>
 }
 

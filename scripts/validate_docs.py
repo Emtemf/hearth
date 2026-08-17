@@ -36,7 +36,9 @@ def markdown_files() -> list[Path]:
     return sorted(
         path
         for path in ROOT.rglob("*.md")
-        if ".git" not in path.parts and ".claude/worktrees" not in path.parts
+        if ".git" not in path.parts
+        and ".claude/worktrees" not in path.parts
+        and "node_modules" not in path.parts
     )
 
 
