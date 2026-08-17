@@ -33,8 +33,8 @@ final class ExchangeRecorder {
             jdbcTemplate.update("""
                     INSERT INTO hearth_exchange
                         (id, session_id, requested_model, effective_model, input_tokens,
-                         output_tokens, recording_status, latency_ms)
-                    SELECT ?, id, ?, ?, NULL, NULL, 'partial', NULL
+                         output_tokens, recording_status, recording_gap_reason, latency_ms)
+                    SELECT ?, id, ?, ?, NULL, NULL, 'partial', 'upstream_in_progress', NULL
                     FROM hearth_session WHERE id = ?
                     """, exchangeId, request.requestedModel(), request.requestedModel(), sessionId);
             jdbcTemplate.update("UPDATE hearth_session SET latest_system_prompt = ?, updated_at = now() WHERE id = ?",
