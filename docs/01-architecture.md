@@ -98,6 +98,8 @@ M2 启用 Platform MCP 时，Claude Code Adapter 追加
 Hearth MCP 合并后生成该文件；`--strict-mcp-config` 防止项目 `.mcp.json` 或用户配置绕过 normalized
 capability / PolicyBundle 约束。文件
 权限为 0600，Session 终止时撤销 token 并删除。M1 不启用 MCP，不传这两个参数。
+
+M1 runnable-surface 只提供 loopback health/status 证明应用能启动及展示 M1.0 fixture contract evidence；它不创建 Agent 进程、不代替 Gateway，也不改变 `WorkerClient` 边界。真正的本机执行仍由 `hearth-worker` daemon 负责，控制面只能通过 `LocalWorkerClient` 调用。
 内置工具另由锁定版本支持的 `--tools`/`--disallowedTools` 和本地 fail-closed hook wrapper 双层约束；MCP
 strict config 不能替代 Bash/Edit/Read 等内置工具治理。
 

@@ -2,8 +2,8 @@ package ai.hearth.worker.spike;
 
 import java.util.List;
 
-record ClaudeCodeCommand(List<String> argv) {
-    static ClaudeCodeCommand forSession(java.nio.file.Path executable, String sessionId) {
+public record ClaudeCodeCommand(List<String> argv) {
+    public static ClaudeCodeCommand forSession(java.nio.file.Path executable, String sessionId) {
         if (sessionId == null || sessionId.isBlank()) {
             throw new IllegalArgumentException("worker.session_id.required");
         }

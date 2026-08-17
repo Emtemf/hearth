@@ -4,15 +4,15 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Objects;
 
-final class ChildEnvironment {
+public final class ChildEnvironment {
     private final Map<String, String> allowedValues;
 
-    ChildEnvironment(Map<String, String> parentEnvironment, Map<String, String> allowedValues) {
+    public ChildEnvironment(Map<String, String> parentEnvironment, Map<String, String> allowedValues) {
         Objects.requireNonNull(parentEnvironment, "parentEnvironment");
         this.allowedValues = Map.copyOf(Objects.requireNonNull(allowedValues, "allowedValues"));
     }
 
-    Map<String, String> forSession(String gatewayCapability, String gatewayBaseUrl) {
+    public Map<String, String> forSession(String gatewayCapability, String gatewayBaseUrl) {
         if (gatewayCapability == null || gatewayCapability.isBlank()) {
             throw new IllegalArgumentException("worker.gateway_capability.required");
         }
