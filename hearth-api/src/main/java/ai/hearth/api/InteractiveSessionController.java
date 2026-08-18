@@ -21,10 +21,15 @@ import org.springframework.http.HttpStatus;
 final class InteractiveSessionController {
     private final InteractiveSessionService service;
     private final InteractiveInvocationService invocationService;
+    private final JdbcInvocationRepository invocationRepository;
 
-    InteractiveSessionController(InteractiveSessionService service, InteractiveInvocationService invocationService) {
+    InteractiveSessionController(
+            InteractiveSessionService service,
+            InteractiveInvocationService invocationService,
+            JdbcInvocationRepository invocationRepository) {
         this.service = service;
         this.invocationService = invocationService;
+        this.invocationRepository = invocationRepository;
     }
 
     @PostMapping
@@ -40,7 +45,10 @@ final class InteractiveSessionController {
 
     @GetMapping("/{sessionId}/invocations")
     Map<String, Object> invocations(@PathVariable("sessionId") UUID sessionId) {
-        return Map.of("data", Map.of("sessionId", sessionId, "content", java.util.List.of()), "error", (Object) null);
+        var response = new LinkedHashMap<String, Object>();
+        response.put("data", Map.of("sessionId", sessionId, "content", invocationRepository.findBySession(sessionId)));
+        response.put("error", null);
+        return response;
     }
     @PostMapping("/{sessionId}/invocations")
     ResponseEntity<Map<String, Object>> invocation(
