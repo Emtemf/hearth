@@ -47,7 +47,7 @@ class JdbcInvocationRepository {
 
     List<InvocationSummary> findBySession(UUID sessionId) {
         return jdbcTemplate.query("""
-                SELECT id, command_id, status, content, assistant_content, created_at, semantic_completed_at
+                SELECT id, command_id, session_id, status, content, assistant_content, created_at, semantic_completed_at
                 FROM hearth_invocation WHERE session_id = ? ORDER BY created_at DESC
                 """, (rs, rowNum) -> new InvocationSummary(
                 rs.getObject("id", UUID.class),
@@ -62,7 +62,7 @@ class JdbcInvocationRepository {
 
     InvocationSummary findById(UUID invocationId) {
         return jdbcTemplate.queryForObject("""
-                SELECT id, command_id, status, content, assistant_content, created_at, semantic_completed_at
+                SELECT id, command_id, session_id, status, content, assistant_content, created_at, semantic_completed_at
                 FROM hearth_invocation WHERE id = ?
                 """, (rs, rowNum) -> new InvocationSummary(
                 rs.getObject("id", UUID.class), rs.getObject("command_id", UUID.class),

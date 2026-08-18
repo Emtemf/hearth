@@ -30,7 +30,7 @@ final class InvocationLifecycleService {
 
     InvocationSummary find(UUID invocationId) {
         return jdbcTemplate.queryForObject("""
-                SELECT id, command_id, status, content, assistant_content, created_at, semantic_completed_at
+                SELECT id, command_id, session_id, status, content, assistant_content, created_at, semantic_completed_at
                 FROM hearth_invocation WHERE id = ?
                 """, (rs, rowNum) -> new InvocationSummary(
                 rs.getObject("id", UUID.class), rs.getObject("command_id", UUID.class),
