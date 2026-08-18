@@ -31,6 +31,10 @@ public final class LocalWorkerDaemon implements AutoCloseable {
                 new ProcessIdentity(sessionId, generation, launchId)));
     }
 
+    public java.util.concurrent.Flow.Publisher<WorkerEvent> events(UUID sessionId) {
+        return client.events(sessionId);
+    }
+
     @Override
     public void close() {
         client.close();

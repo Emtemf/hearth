@@ -59,9 +59,27 @@ public final class WorkerDaemonApplication {
             };
             writer.write(result.state() + "\t" + result.detail() + "\n");
             writer.flush();
+            if ("invoke".equals(fields.get("action"))) {
+                streamEvents(socket, daemon, sessionId, UUID.fromString(fields.get("invocationId")));
+            }
         } catch (IllegalArgumentException exception) {
             socket.getOutputStream().write("REJECTED_BEFORE_COMMIT\tworker.request_invalid\n".getBytes(StandardCharsets.UTF_8));
         }
+    }
+
+    private static void streamEvents(Socket socket, LocalWorkerDaemon daemon, UUID sessionId, UUID invocationId) {
+        daemon.events(sessionId).subscribe(new java.util.concurrent.Flow.Subscriber<>() {
+            @Override public void onSubscribe(java.util.concurrent.Flow.Subscription subscription) { subscription.request(Long.MAX_VALUE); }
+            @Override public void onNext(WorkerEvent event) {
+                try {
+                    var content = Base64.getEncoder().encodeToString(event.content().getBytes(StandardCharsets.UTF_8));
+                    socket.getOutputStream().write(("EVENT\ttype=" + event.type() + "\tcontent=" + content + "\n").getBytes(StandardCharsets.UTF_8));
+                    socket.getOutputStream().flush();
+                } catch (IOException ignored) { }
+            }
+            @Override public void onError(Throwable throwable) { }
+            @Override public void onComplete() { }
+        });
     }
 
     private static Map.Entry<String, String>[] parse(String line) {
