@@ -17,6 +17,7 @@ import java.util.concurrent.SubmissionPublisher;
 public final class LocalWorkerClient implements WorkerClient, AutoCloseable {
     private final Map<UUID, ManagedProcess> processes = new ConcurrentHashMap<>();
     private final Map<UUID, SubmissionPublisher<WorkerEvent>> eventPublishers = new ConcurrentHashMap<>();
+    private final Map<UUID, java.util.concurrent.CopyOnWriteArrayList<WorkerEvent>> eventHistory = new ConcurrentHashMap<>();
     private final Map<String, String> allowedEnvironment;
     private final String gatewayBaseUrl;
     private final String gatewayCapability;
@@ -43,6 +44,7 @@ public final class LocalWorkerClient implements WorkerClient, AutoCloseable {
             processBuilder.environment().putAll(environment);
             var process = processBuilder.start();
             eventPublishers.put(command.process().sessionId(), new SubmissionPublisher<>());
+            eventHistory.put(command.process().sessionId(), new java.util.concurrent.CopyOnWriteArrayList<>());
             processes.put(command.process().sessionId(), new ManagedProcess(process, command.process()));
             startReader(command.process().sessionId(), process.getInputStream());
             return result(command.commandId(), command.process(), "COMMITTED", "worker.process_started");
@@ -90,13 +92,21 @@ public final class LocalWorkerClient implements WorkerClient, AutoCloseable {
         return eventPublishers.computeIfAbsent(sessionId, ignored -> new SubmissionPublisher<>());
     }
 
+    public java.util.List<WorkerEvent> eventHistory(UUID sessionId) {
+        return java.util.List.copyOf(eventHistory.getOrDefault(sessionId, new java.util.concurrent.CopyOnWriteArrayList<>()));
+    }
+
+
     private void startReader(UUID sessionId, java.io.InputStream inputStream) {
         Thread.startVirtualThread(() -> {
             try (var reader = new java.io.BufferedReader(new java.io.InputStreamReader(inputStream, StandardCharsets.UTF_8))) {
                 String line;
                 while ((line = reader.readLine()) != null) {
                     var publisher = eventPublishers.get(sessionId);
-                    if (publisher != null) publisher.submit(parseEvent(sessionId, line));
+                    var event = parseEvent(sessionId, line);
+                    var history = eventHistory.get(sessionId);
+                    if (history != null) history.add(event);
+                    if (publisher != null) publisher.submit(event);
                 }
             } catch (IOException exception) {
                 var publisher = eventPublishers.get(sessionId);
