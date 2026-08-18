@@ -99,8 +99,9 @@ hearth/                    根 pom，dependencyManagement
 ```
 
 **M1 需要启动**：`hearth-core` + `hearth-gateway` + `hearth-agent` + `hearth-worker`（本机实现）+
-`hearth-api`，并构建 `frontend/` 静态资源。M1 的 Web UI 和 REST/SSE 契约由 `hearth-api` 提供，
-因此不能把它推迟。
+`hearth-api`，并构建 `frontend/` 静态资源。当前 runnable-surface slice 仅先创建 `hearth-api` 和既有
+`hearth-worker` contract harness，以 loopback Actuator health 与只读 M1 status 作为可运行证据；它不替代
+M1 的 Web UI、REST/SSE 契约或完整服务组合。Spring AI 仍不属于此 slice。
 
 M2 再创建 `hearth-orchestrator`、`hearth-artifact` 与 `hearth-platform-mcp`；M3 创建 `hearth-memory`、`hearth-trigger`，
 并在 `hearth-trigger` 启用 Quartz/ShedLock 自动化。根 pom 只声明当前里程碑实际存在的模块，避免

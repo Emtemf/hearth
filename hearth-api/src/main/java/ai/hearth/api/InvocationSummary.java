@@ -1,0 +1,14 @@
+package ai.hearth.api;
+
+import java.time.Instant;
+import java.util.UUID;
+
+record InvocationSummary(
+        UUID id,
+        UUID commandId,
+        UUID sessionId,
+        String status,
+        String content,
+        String assistantContent,
+        Instant createdAt,
+        Instant semanticCompletedAt) {}

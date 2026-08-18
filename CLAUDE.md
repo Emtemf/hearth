@@ -11,6 +11,14 @@
 
 全局 rules（security、testing、coding-style 等）已在 `~/.claude/rules/` 里，不在此重复。
 
+### Specification-Driven Development
+
+跨 context、invariant、API 或 migration 变更使用 `changes/README.md` 规定的
+`proposal → spec → implement → verify` 流程。阶段通过显式命令加载：
+`/sdd-propose`、`/sdd-spec`、`/sdd-implement <change-id>`、`/sdd-verify <change-id>`。
+当前事实仍由 `docs/16-spec-governance.md` 的 canonical owner map 决定；命令和 rules 只做流程及路由，
+不复制完整规格。
+
 ### 长期记忆
 
 每次会话结束前，检查以下内容是否需要更新：
