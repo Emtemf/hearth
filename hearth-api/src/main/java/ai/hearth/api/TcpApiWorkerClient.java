@@ -52,10 +52,13 @@ final class TcpApiWorkerClient implements ApiWorkerClient {
     }
 
     private String decodeEventContent(String line) {
-        for (var part : line.split("\\t")) {
-            if (part.startsWith("content=")) return new String(Base64.getDecoder().decode(part.substring(8)), StandardCharsets.UTF_8);
+        StringBuilder output = new StringBuilder();
+        for (var event : line.split("\\n")) {
+            for (var part : event.split("\\t")) {
+                if (part.startsWith("content=")) output.append(new String(Base64.getDecoder().decode(part.substring(8)), StandardCharsets.UTF_8));
+            }
         }
-        return "";
+        return output.toString();
     }
 
     private String request(String action, UUID sessionId, long generation, UUID launchId, UUID commandId,
@@ -75,6 +78,15 @@ final class TcpApiWorkerClient implements ApiWorkerClient {
                     var reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8))) {
                 writer.write(line + "\n");
                 writer.flush();
+                if ("action=invoke".equals(action)) {
+                    var events = new StringBuilder();
+                    String event;
+                    while ((event = reader.readLine()) != null) {
+                        events.append(event).append('\n');
+                        if (event.contains("type=result")) break;
+                    }
+                    return events.toString();
+                }
                 return reader.readLine();
             }
         }

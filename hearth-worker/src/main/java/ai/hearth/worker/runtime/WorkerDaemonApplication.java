@@ -68,6 +68,7 @@ public final class WorkerDaemonApplication {
     }
 
     private static void streamEvents(Socket socket, LocalWorkerDaemon daemon, UUID sessionId, UUID invocationId) {
+        var completed = new java.util.concurrent.CountDownLatch(1);
         daemon.events(sessionId).subscribe(new java.util.concurrent.Flow.Subscriber<>() {
             @Override public void onSubscribe(java.util.concurrent.Flow.Subscription subscription) { subscription.request(Long.MAX_VALUE); }
             @Override public void onNext(WorkerEvent event) {
@@ -75,11 +76,17 @@ public final class WorkerDaemonApplication {
                     var content = Base64.getEncoder().encodeToString(event.content().getBytes(StandardCharsets.UTF_8));
                     socket.getOutputStream().write(("EVENT\ttype=" + event.type() + "\tcontent=" + content + "\n").getBytes(StandardCharsets.UTF_8));
                     socket.getOutputStream().flush();
+                    if ("result".equals(event.type())) completed.countDown();
                 } catch (IOException ignored) { }
             }
             @Override public void onError(Throwable throwable) { }
             @Override public void onComplete() { }
         });
+        try {
+            completed.await(120, java.util.concurrent.TimeUnit.SECONDS);
+        } catch (InterruptedException exception) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     private static Map.Entry<String, String>[] parse(String line) {
