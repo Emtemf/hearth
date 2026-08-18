@@ -67,17 +67,24 @@ public final class WorkerDaemonApplication {
         }
     }
 
+    private static void writeEvent(Socket socket, WorkerEvent event) {
+        try {
+            var content = Base64.getEncoder().encodeToString(event.content().getBytes(StandardCharsets.UTF_8));
+            socket.getOutputStream().write(("EVENT\ttype=" + event.type() + "\tcontent=" + content + "\n").getBytes(StandardCharsets.UTF_8));
+            socket.getOutputStream().flush();
+        } catch (IOException ignored) { }
+    }
     private static void streamEvents(Socket socket, LocalWorkerDaemon daemon, UUID sessionId, UUID invocationId) {
         var completed = new java.util.concurrent.CountDownLatch(1);
+        for (var event : daemon.eventHistory(sessionId)) {
+            writeEvent(socket, event);
+            if ("result".equals(event.type())) completed.countDown();
+        }
         daemon.events(sessionId).subscribe(new java.util.concurrent.Flow.Subscriber<>() {
             @Override public void onSubscribe(java.util.concurrent.Flow.Subscription subscription) { subscription.request(Long.MAX_VALUE); }
             @Override public void onNext(WorkerEvent event) {
-                try {
-                    var content = Base64.getEncoder().encodeToString(event.content().getBytes(StandardCharsets.UTF_8));
-                    socket.getOutputStream().write(("EVENT\ttype=" + event.type() + "\tcontent=" + content + "\n").getBytes(StandardCharsets.UTF_8));
-                    socket.getOutputStream().flush();
-                    if ("result".equals(event.type())) completed.countDown();
-                } catch (IOException ignored) { }
+                writeEvent(socket, event);
+                if ("result".equals(event.type())) completed.countDown();
             }
             @Override public void onError(Throwable throwable) { }
             @Override public void onComplete() { }
@@ -88,6 +95,7 @@ public final class WorkerDaemonApplication {
             Thread.currentThread().interrupt();
         }
     }
+
 
     private static Map.Entry<String, String>[] parse(String line) {
         return java.util.Arrays.stream(line.split("\\t"))

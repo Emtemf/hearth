@@ -106,7 +106,9 @@ public final class LocalWorkerClient implements WorkerClient, AutoCloseable {
                     var event = parseEvent(sessionId, line);
                     var history = eventHistory.get(sessionId);
                     if (history != null) history.add(event);
-                    if (publisher != null) publisher.submit(event);
+                    if (publisher != null) {
+                        try { publisher.submit(event); } catch (IllegalStateException ignored) { }
+                    }
                 }
             } catch (IOException exception) {
                 var publisher = eventPublishers.get(sessionId);
