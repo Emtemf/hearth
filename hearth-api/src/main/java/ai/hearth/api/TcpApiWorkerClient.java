@@ -10,6 +10,7 @@ import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicReference;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
@@ -38,7 +39,8 @@ final class TcpApiWorkerClient implements ApiWorkerClient {
             var launch = request("action=launch", sessionId, 1, launchId, commandId, null, null);
             if (!launch.startsWith("COMMITTED")) return new WorkerInvocationResult("", launch);
             var result = request("action=invoke", sessionId, 1, launchId, commandId, invocationId, content);
-            return new WorkerInvocationResult(result, "worker_connected");
+            var assistant = result.startsWith("EVENT") ? decodeEventContent(result) : result;
+            return new WorkerInvocationResult(assistant, "worker_connected");
         } catch (IOException exception) {
             return new WorkerInvocationResult("", "worker_transport_failed");
         }
@@ -47,6 +49,13 @@ final class TcpApiWorkerClient implements ApiWorkerClient {
     @Override
     public WorkerCancellationResult cancel(UUID invocationId) {
         return new WorkerCancellationResult("CANCELLING", "worker_cancel_queued");
+    }
+
+    private String decodeEventContent(String line) {
+        for (var part : line.split("\\t")) {
+            if (part.startsWith("content=")) return new String(Base64.getDecoder().decode(part.substring(8)), StandardCharsets.UTF_8);
+        }
+        return "";
     }
 
     private String request(String action, UUID sessionId, long generation, UUID launchId, UUID commandId,
