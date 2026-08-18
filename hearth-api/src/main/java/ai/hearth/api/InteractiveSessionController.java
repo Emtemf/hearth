@@ -11,6 +11,8 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.bind.annotation.ResponseStatus;
+import org.springframework.http.HttpStatus;
 
 @RestController
 @RequestMapping("/api/v1/sessions")
@@ -27,18 +29,22 @@ final class InteractiveSessionController {
     @PostMapping
     Map<String, Object> create(@RequestBody CreateSessionRequest request) {
         var session = service.create(request);
-        return success(Map.of(
-                "id", session.id(),
-                "gatewayBaseUrl", "/s/" + session.id() + "/anthropic",
-                "effectiveModel", session.effectiveModel(),
-                "gatewayCapability", session.gatewayCapability()));
+        var data = new LinkedHashMap<String, Object>();
+        data.put("id", session.id());
+        data.put("gatewayBaseUrl", "/s/" + session.id() + "/anthropic");
+        data.put("effectiveModel", session.effectiveModel());
+        data.put("providerConfigured", true);
+        return success(data);
     }
 
-    @PostMapping("/{sessionId}/messages")
-    ResponseEntity<Map<String, Object>> message(
+    @PostMapping("/{sessionId}/invocations")
+    ResponseEntity<Map<String, Object>> invocation(
             @PathVariable("sessionId") UUID sessionId,
             @RequestHeader(value = "Authorization", defaultValue = "") String authorization,
             @RequestBody InvokeRequest request) {
+        if (request.content() == null || request.content().isBlank()) {
+            return ResponseEntity.badRequest().body(success(Map.of("status", "content_required")));
+        }
         var response = invocationService.invoke(sessionId, request.content(), request.commandId());
         return ResponseEntity.ok(success(Map.of(
                 "sessionId", sessionId,
