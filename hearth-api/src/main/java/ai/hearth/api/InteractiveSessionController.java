@@ -42,8 +42,7 @@ final class InteractiveSessionController {
     Map<String, Object> invocations(@PathVariable("sessionId") UUID sessionId) {
         return Map.of("data", Map.of("sessionId", sessionId, "content", java.util.List.of()), "error", (Object) null);
     }
-
-
+    @PostMapping("/{sessionId}/invocations")
     ResponseEntity<Map<String, Object>> invocation(
             @PathVariable("sessionId") UUID sessionId,
             @RequestHeader(value = "Authorization", defaultValue = "") String authorization,
