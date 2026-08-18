@@ -9,7 +9,7 @@ import org.springframework.stereotype.Repository;
 
 @Repository
 @ConditionalOnProperty(name = "hearth.persistence.enabled", havingValue = "true")
-final class JdbcInvocationRepository {
+class JdbcInvocationRepository {
     private final JdbcTemplate jdbcTemplate;
 
     JdbcInvocationRepository(JdbcTemplate jdbcTemplate) {
