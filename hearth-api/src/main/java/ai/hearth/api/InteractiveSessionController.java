@@ -9,6 +9,7 @@ import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
+import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.bind.annotation.ResponseStatus;
@@ -37,7 +38,12 @@ final class InteractiveSessionController {
         return success(data);
     }
 
-    @PostMapping("/{sessionId}/invocations")
+    @GetMapping("/{sessionId}/invocations")
+    Map<String, Object> invocations(@PathVariable("sessionId") UUID sessionId) {
+        return Map.of("data", Map.of("sessionId", sessionId, "content", java.util.List.of()), "error", (Object) null);
+    }
+
+
     ResponseEntity<Map<String, Object>> invocation(
             @PathVariable("sessionId") UUID sessionId,
             @RequestHeader(value = "Authorization", defaultValue = "") String authorization,
