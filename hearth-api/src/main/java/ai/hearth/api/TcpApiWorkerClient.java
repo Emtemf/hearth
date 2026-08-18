@@ -15,7 +15,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 @Component
-@ConditionalOnProperty(name = "hearth.persistence.enabled", havingValue = "true")
+@ConditionalOnProperty(name = "hearth.worker.transport", havingValue = "tcp")
 final class TcpApiWorkerClient implements ApiWorkerClient {
     private final String host;
     private final int port;

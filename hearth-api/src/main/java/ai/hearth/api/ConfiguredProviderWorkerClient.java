@@ -5,7 +5,7 @@ import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Component;
 
 @Component
-@ConditionalOnProperty(name = "hearth.persistence.enabled", havingValue = "true")
+@ConditionalOnProperty(name = "hearth.worker.transport", havingValue = "provider", matchIfMissing = true)
 final class ConfiguredProviderWorkerClient implements ApiWorkerClient {
     private final AnthropicUpstreamClient upstream;
     private final UUID launchId = UUID.randomUUID();
