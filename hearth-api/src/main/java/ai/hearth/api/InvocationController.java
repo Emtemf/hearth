@@ -13,7 +13,7 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
 @RestController
-@RequestMapping("/api/v1/sessions")
+@RequestMapping("/api/v1/invocation-compat")
 @ConditionalOnProperty(name = "hearth.persistence.enabled", havingValue = "true")
 final class InvocationController {
     private final InteractiveInvocationService invocationService;
