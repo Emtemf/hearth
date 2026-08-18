@@ -35,6 +35,9 @@ public final class LocalWorkerDaemon implements AutoCloseable {
         return client.events(sessionId);
     }
 
+    public void clearEventHistory(UUID sessionId) {
+        client.clearEventHistory(sessionId);
+    }
     public java.util.List<WorkerEvent> eventHistory(UUID sessionId) {
         return client.eventHistory(sessionId);
     }

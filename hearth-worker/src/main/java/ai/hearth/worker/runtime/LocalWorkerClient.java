@@ -92,6 +92,9 @@ public final class LocalWorkerClient implements WorkerClient, AutoCloseable {
         return eventPublishers.computeIfAbsent(sessionId, ignored -> new SubmissionPublisher<>());
     }
 
+    public void clearEventHistory(UUID sessionId) {
+        eventHistory.computeIfAbsent(sessionId, ignored -> new java.util.concurrent.CopyOnWriteArrayList<>()).clear();
+    }
     public java.util.List<WorkerEvent> eventHistory(UUID sessionId) {
         return java.util.List.copyOf(eventHistory.getOrDefault(sessionId, new java.util.concurrent.CopyOnWriteArrayList<>()));
     }
